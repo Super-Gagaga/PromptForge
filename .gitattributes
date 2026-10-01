@@ -1,0 +1,10 @@
+# Normalize every text file to LF so diffs stay stable across platforms and
+# the generated lib/ + root mirrors remain byte-identical to the build output.
+* text=auto eol=lf
+
+*.svg text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
