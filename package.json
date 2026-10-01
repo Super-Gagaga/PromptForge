@@ -1,0 +1,38 @@
+{
+  "name": "dsh-prompt-forge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PromptForge for DSH: a sparkle button beside the composer send control that rewrites the current draft with an existing DSH model, plus a settings page for model and reasoning effort.",
+  "type": "module",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "build.mjs",
+    "src"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node build.mjs && node tools/selfcheck.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "license": "MIT"
+}

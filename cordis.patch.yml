@@ -1,0 +1,11 @@
+# dsh-prompt-forge — one row over the shipped Web composition.
+#
+# The Host half owns the durable settings document, the browser routes, and the
+# model call; the browser half (declared by package.json's dsh.client) renders
+# the sparkle control beside the composer submit action and the settings page.
+# Nothing shipped is overridden, so disabling or removing this bundle restores
+# the built-in composer exactly.
+
+- insert:
+    - id: prompt-forge
+      name: 'dsh-prompt-forge'
