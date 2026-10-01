@@ -1,0 +1,22 @@
+# Local DSH session transcripts (conversation logs, never shipped)
+dsh-session-*/
+
+# Dependencies and build output
+node_modules/
+*.tsbuildinfo
+
+# Local settings / credentials
+.dsh/
+prompt-forge.json
+*.local.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
