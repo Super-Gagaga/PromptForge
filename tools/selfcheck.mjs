@@ -127,7 +127,6 @@ function installPrimitives() {
   };
   return {
     IconLoadingOutlineRegular: icon('loading'),
-    IconSparkleRegular: icon('sparkle'),
     Tooltip: function Tooltip(props) {
       return props.children;
     },
@@ -546,6 +545,56 @@ check('the locale namespace registers complete zh and en dictionaries', () => {
   for (const value of Object.values(en.dict)) assert.equal(typeof value, 'string');
 });
 
+check('settings navigation icon handles mounting, language changes and disposal without altering other sections', () => {
+  const savedDocument = globalThis.document;
+  const savedObserver = globalThis.MutationObserver;
+  const attributes = new Map();
+  const button = {
+    setAttribute: (key, value) => attributes.set(key, value),
+    removeAttribute: (key) => attributes.delete(key),
+  };
+  const label = { textContent: '', parentElement: button };
+  let mounted = false;
+  let notify;
+  let disconnected = false;
+  globalThis.document = {
+    body: {},
+    getElementById: () => ({}),
+    querySelectorAll: (selector) => selector === '[data-pf-nav-icon]'
+      ? (attributes.has('data-pf-nav-icon') ? [button] : [])
+      : (mounted ? [label] : []),
+  };
+  globalThis.MutationObserver = class {
+    constructor(callback) { notify = callback; }
+    observe() {}
+    disconnect() { disconnected = true; }
+  };
+  const run = makeClientContext();
+  try {
+    client.apply(run.ctx);
+    assert.equal(attributes.has('data-pf-nav-icon'), false);
+    mounted = true;
+    for (const { dict } of run.dictionaries) {
+      label.textContent = dict.nav;
+      notify();
+      assert.equal(attributes.has('data-pf-nav-icon'), true);
+    }
+    label.textContent = 'Models';
+    notify();
+    assert.equal(attributes.has('data-pf-nav-icon'), false);
+    label.textContent = run.dictionaries[0].dict.nav;
+    notify();
+    for (const dispose of run.effects) dispose();
+    assert.equal(disconnected, true);
+    assert.equal(attributes.has('data-pf-nav-icon'), false);
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+    if (savedObserver === undefined) delete globalThis.MutationObserver;
+    else globalThis.MutationObserver = savedObserver;
+  }
+});
+
 /* --- 6. the button renders nothing while the composer is empty ---------- */
 const button = clientRun.registrations.find((entry) => entry.options.name === 'conversation.input.right');
 const section = clientRun.registrations.find((entry) => entry.options.name === 'settings.section');
@@ -574,13 +623,16 @@ const renderButton = (input, sessionId = 'session-1') => {
   const input = makeInput('fix the login bug');
   const { tree } = renderButton(input);
   const rendered = find(tree, (node) => node.type === 'button');
-  check('the button appears once the draft has text, as a sparkle', () => {
+  check('the button appears once the draft has text, with a theme-aware text-and-spark icon', () => {
     assert.notEqual(rendered, null, 'a draft with text must render the control');
     assert.equal(rendered.props['aria-busy'], 'false');
     assert.equal(rendered.props.disabled, false);
-    const glyph = find(rendered, (node) => typeof node.type === 'function' && node.type.__iconName !== undefined);
+    const glyph = find(rendered, (node) => node.type?.name === 'PromptForgeTextSparkIcon');
     assert.notEqual(glyph, null, 'the button must draw an icon');
-    assert.equal(glyph.type.__iconName, 'sparkle');
+    const svg = glyph.type(glyph.props);
+    assert.equal(svg.type, 'svg');
+    assert.equal(svg.props.stroke, 'currentColor');
+    assert.equal(svg.props.width, 20);
     assert.equal(glyph.props.className, undefined, 'the idle glyph must not spin');
   });
 }

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Prompt Optimization",
+    "description": "Please restart DeepSeek Harness after installing or updating the plugin. A text-and-spark button appears beside Send when the composer contains text. Click it to optimize the draft with a configured model. Results replace the composer text without sending. Choose the model and reasoning effort in settings."
+  }
+}

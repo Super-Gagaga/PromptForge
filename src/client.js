@@ -3,7 +3,7 @@
  *
  * Two surfaces, both additive:
  *
- *   1. `conversation.input.right` — a sparkle control beside the composer's
+ *   1. `conversation.input.right` — a text-and-spark control beside the composer's
  *      submit action. It exists only while the draft has text; clicking it
  *      replaces the whole draft with a model-optimized prompt and never sends.
  *      While the call is in flight it becomes a spinner.
@@ -18,7 +18,7 @@
  * @module dsh-prompt-forge/client
  */
 
-import { IconLoadingOutlineRegular, IconSparkleRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives';
+import { IconLoadingOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives';
 
 /**
  * The React runtime the loader exposes as a module-global. The `require`
@@ -26,6 +26,18 @@ import { IconLoadingOutlineRegular, IconSparkleRegular, Tooltip } from '@deepsee
  * factory (the offline self-check does exactly that).
  */
 const ReactRuntime = typeof React === 'undefined' ? require('react') : React;
+
+/** A text-and-spark mark that follows the button's theme and state colors. */
+function PromptForgeTextSparkIcon({ size = 20, ...props }) {
+  return ReactRuntime.createElement('svg', {
+    ...props, width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
+    stroke: 'currentColor', strokeWidth: 2.2, strokeLinecap: 'round', strokeLinejoin: 'round',
+    focusable: 'false',
+  }, [
+    ReactRuntime.createElement('path', { key: 'text', d: 'M4 7h9M4 12h12M4 17h8' }),
+    ReactRuntime.createElement('path', { key: 'spark', stroke: 'none', fill: 'currentColor', d: 'm18 2 1.35 3.65L23 7l-3.65 1.35L18 12l-1.35-3.65L13 7l3.65-1.35Z' }),
+  ]);
+}
 
 /* Locale namespace every visible string of this plugin lives under. */
 const NS = PACKAGE_NAME;
@@ -37,7 +49,7 @@ const zh = {
   'action.busy': '正在优化提示词…',
   'action.failed': '优化失败：{message}',
   'nav': '提示词优化',
-  'intro': '在输入框旁点一下星星，当前草稿就会被重写成更清晰的提示词。优化结果只替换输入框内容，不会自动发送。',
+  'intro': '在输入框旁点击优化按钮，当前草稿就会被重写成更清晰的提示词。优化结果只替换输入框内容，不会自动发送。',
   'model.heading': '模型',
   'model.hint': '使用 DSH 已配置的模型；此处列出的就是当前可路由的全部模型。',
   'model.default': '跟随默认模型（{name}）',
@@ -66,7 +78,7 @@ const en = {
   'action.busy': 'Optimizing prompt…',
   'action.failed': 'Optimization failed: {message}',
   'nav': 'Prompt Forge',
-  'intro': 'Click the sparkle beside the composer and the current draft is rewritten into a clearer prompt. The result only replaces the composer text — it is never sent for you.',
+  'intro': 'Click the text-and-spark button beside the composer and the current draft is rewritten into a clearer prompt. The result only replaces the composer text — it is never sent for you.',
   'model.heading': 'Model',
   'model.hint': 'Uses the models DSH already has configured; this list is exactly what can be routed right now.',
   'model.default': 'Follow the default model ({name})',
@@ -107,8 +119,14 @@ function translate(dict) {
 /** One stylesheet tag for this plugin, created on first use. */
 const STYLE_TAG_ID = `${PACKAGE_NAME}-style`;
 
+const NAV_ICON_MASK = `url("data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M4 7h9M4 12h12M4 17h8" stroke="black" stroke-width="2.2" stroke-linecap="round"/><path d="m18 2 1.35 3.65L23 7l-3.65 1.35L18 12l-1.35-3.65L13 7l3.65-1.35Z" fill="black"/></svg>')}")`;
+
 /** The rules every surface of this plugin reads. */
 const CSS = `
+[data-shortcut-modal="settings"] button[data-pf-nav-icon] > svg{display:none}
+[data-shortcut-modal="settings"] button[data-pf-nav-icon]::before{content:"";display:block;flex:none;width:16px;height:16px;background:currentColor;mask:${NAV_ICON_MASK} center/contain no-repeat;-webkit-mask:${NAV_ICON_MASK} center/contain no-repeat}
+[data-plugin-detail="dsh-prompt-forge"] [class$="_detailDesc"],
+[data-plugin-detail="dsh-prompt-forge"] [data-plugin-row] [class$="_rowModule"]{white-space:pre-line}
 .PF-btn{display:inline-flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:0;border:0;border-radius:999px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;transition:background-color .12s,color .12s,opacity .12s}
 .PF-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .PF-btn:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
@@ -149,6 +167,27 @@ function ensureStyleTag() {
   document.head.appendChild(tag);
   return () => {
     tag.remove();
+  };
+}
+
+/** DSH currently gives custom settings sections a fixed gear, with no icon slot. */
+function installSettingsNavIcon() {
+  if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return () => {};
+  const labels = new Set([zh.nav, en.nav]);
+  const selector = '[data-shortcut-modal="settings"] button > span[class$="_navLabel"]';
+  const update = () => {
+    for (const label of document.querySelectorAll(selector)) {
+      const button = label.parentElement;
+      if (labels.has(label.textContent.trim())) button.setAttribute('data-pf-nav-icon', '');
+      else button.removeAttribute('data-pf-nav-icon');
+    }
+  };
+  const observer = new MutationObserver(update);
+  observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+  update();
+  return () => {
+    observer.disconnect();
+    for (const button of document.querySelectorAll('[data-pf-nav-icon]')) button.removeAttribute('data-pf-nav-icon');
   };
 }
 
@@ -384,7 +423,7 @@ function effectiveSelection(catalog, settings) {
 /* ------------------------------------------------------------ composer seat */
 
 /**
- * The sparkle control beside the composer submit action.
+ * The text-and-spark control beside the composer submit action.
  *
  * It renders nothing while the draft is empty, which is what makes it "appear
  * when there is text". While a call is in flight it renders a spinner and takes
@@ -483,8 +522,8 @@ function PromptForgeButton(props) {
     onClick: () => {
       run().catch(() => {});
     },
-  }, ReactRuntime.createElement(busy ? IconLoadingOutlineRegular : IconSparkleRegular, {
-    size: 16,
+  }, ReactRuntime.createElement(busy ? IconLoadingOutlineRegular : PromptForgeTextSparkIcon, {
+    size: busy ? 16 : 20,
     className: busy ? 'PF-spin' : undefined,
     'aria-hidden': true,
   })));
@@ -690,6 +729,7 @@ let clientCtx = null;
 function apply(ctx) {
   clientCtx = ctx;
   ctx.effect(() => ensureStyleTag(), `${PACKAGE_NAME}: stylesheet`);
+  ctx.effect(() => installSettingsNavIcon(), `${PACKAGE_NAME}: settings navigation icon`);
 
   const t = ctx.locale.bind(NS);
   ctx.locale.register(NS, 'zh', zh);
