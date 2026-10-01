@@ -1,0 +1,59 @@
+# PromptForge
+
+DSH 提示词优化插件。输入框有文字时，在发送控件旁显示星星按钮；点击后显示加载动画，调用 DSH 已配置的模型重写草稿。结果只替换输入框，不自动发送。
+
+## 使用
+
+1. 在 DSH 的「设置 → 提示词优化」中选择模型和思考强度，也可以修改优化指令。模型列表来自当前 DSH 的模型目录。
+2. 输入草稿，点击星星按钮，等待优化完成。
+3. 检查结果，再自行发送。
+
+优化是独立模型请求，不会修改聊天会话的模型或思考强度，也不会作为聊天消息写入会话。请求期间若编辑草稿、提交消息或切换会话，较晚返回的结果会被丢弃。调用失败时保留原草稿，可在设置页查看错误。
+
+## 安装
+
+克隆本仓库后重新构建，再重启 DSH 或重新加载插件：
+
+```powershell
+git clone https://github.com/Super-Gagaga/PromptForge.git
+cd PromptForge
+npm test
+```
+
+为可由 CLI 管理的 profile 安装时，将下面的 `<profile>` 换为实际名称、`<path>` 换为本仓库路径：
+
+```powershell
+dsh plugin --profile <profile> add 'link:<path>/PromptForge'
+```
+
+桌面 profile 由 Electron 应用管理，CLI 不支持直接启动它。插件通过 `package.json` 的 `dsh.bundle` 与 `dsh.client` 字段和本包的 `cordis.patch.yml` 装配，Host 与浏览器半体共同生效。
+
+## 开发与验证
+
+需要 Node.js，无需安装额外构建依赖。
+
+```powershell
+npm run build
+npm test
+```
+
+编辑 `src/`，不要直接修改生成文件。构建会同步生成 `lib/index.js`、`lib/client.js` 及根目录镜像。
+
+- `src/host.js`：设置读写、模型调用和 HTTP 接口。
+- `src/client.js`：星星按钮、草稿替换、设置页和中文/英文文案。
+- `src/shared.js`：默认优化指令和限制。
+- `tools/selfcheck.mjs`：隔离设置目录的自动自检，覆盖插件加载、请求、草稿边界、设置保存与失败处理。
+
+设置保存在 `$DSH_HOME/prompt-forge.json`；未指定 `DSH_HOME` 时使用用户目录的 `.dsh/prompt-forge.json`。每次优化最多接受 60,000 字符，输出上限 4,096 tokens，请求超时 120 秒。
+
+## 常见问题
+
+若出现 `pending (waiting for service: optional)`，应更新到本项目当前构建并重新加载。当前 DSH Cordis 将 `inject` 对象的键解释为服务名，不支持 `inject: { optional: [...] }`。本插件使用按需服务获取，避免阻塞顶层启用。
+
+## 验证记录
+
+构建、自检与真实 DSH 环境的验证结论见 [VERIFICATION.md](VERIFICATION.md)。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 Super-Gagaga
