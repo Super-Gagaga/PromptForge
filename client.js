@@ -70,12 +70,28 @@ const EMPTY_OUTPUT_MESSAGE = 'prompt-forge: the model returned no usable prompt 
 /**
  * Marker opening the appended skill-reference block.
  *
- * A skill is not a path: DSH loads one through the model-facing `skill` tool,
- * keyed by name. The block therefore names the skills the rewrite depends on and
- * says how to load them, instead of inventing a text token the agent would not
- * understand.
+ * Each entry is written as the `/name` gesture, which is not decoration: DSH
+ * scans the claimed user message for `/([a-z0-9]+(?:-[a-z0-9]+)*)` and injects
+ * that skill's body before the step runs. A bare name would only work if the
+ * agent chose to call the `skill` tool, so the gesture is what makes the
+ * reference actionable the moment the user sends the prompt.
  */
-const SKILL_REFERENCE_MARKER = 'Skills this task may need (load one with the skill tool by name):';
+const SKILL_REFERENCE_MARKER = 'Skills this task may need (each line is a /command the agent loads):';
+
+/**
+ * Render one skill name as the gesture DSH recognizes in a user message.
+ *
+ * The scanner's pattern is `/(^|\s)\/([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)`, so a
+ * name that is not kebab-case could never be invoked and is refused here rather
+ * than appended as a token that silently does nothing.
+ *
+ * @param name - catalog skill name.
+ * @returns `/name`, or `undefined` when the gesture grammar cannot carry it.
+ */
+function formatSkillGesture(name) {
+  if (typeof name !== 'string' || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name)) return undefined;
+  return `/${name}`;
+}
 
 /* ---------------------------------------------------------- reference syntax */
 

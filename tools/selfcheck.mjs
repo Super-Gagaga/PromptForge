@@ -653,7 +653,7 @@ for (const [label, answer, expectations] of [
       skills: ['office-docx', 'human-only', 'invented-skill'],
     },
     {
-      prompt: 'Fix the login flow.\n\n@src/host.js\n@"src/my module.js"\n\nSkills this task may need (load one with the skill tool by name):\noffice-docx',
+      prompt: 'Fix the login flow.\n\n@src/host.js\n@"src/my module.js"\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx',
       files: ['src/host.js', 'src/my module.js'],
       skills: ['office-docx'],
       queried: ['src/host', 'my module', 'src/does-not-exist'],
@@ -878,7 +878,7 @@ for (const [label, answer, expectations] of [
     assert.equal(llm.calls.length, 2, 'the empty skill list is worth one more question');
     assert.match(llm.calls[1].messages[0].content[0].text, /<available_skills>/,
       'the skill question must offer the real catalog');
-    assert.equal(result.json.prompt, 'Fix it.\n\n@src/host.js\n\nSkills this task may need (load one with the skill tool by name):\noffice-docx');
+    assert.equal(result.json.prompt, 'Fix it.\n\n@src/host.js\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx');
     assert.deepEqual(result.json.files, ['src/host.js']);
     assert.deepEqual(result.json.skills, ['office-docx']);
   });
@@ -1107,7 +1107,8 @@ for (const scenario of [
     assert.equal(composition.second.prompt, composition.first.prompt);
     assert.equal(composition.second.files.length + composition.second.skills.length, 0);
     assert.equal(composition.merged.prompt.split('Skills this task may need').length, 2);
-    assert.ok(composition.merged.prompt.endsWith('office-docx\noffice-xlsx'));
+    assert.ok(composition.merged.prompt.endsWith('/office-docx\n/office-xlsx'),
+      'consolidated skill rows keep the gesture form');
   });
   check('managed skill blocks inside code fences are preserved as examples', () => {
     assert.equal(composition.fenced.prompt.split('Skills this task may need').length, 3);
@@ -1161,7 +1162,7 @@ for (const scenario of [
         return new Promise(()=>{}); // Simulate a provider ignoring cancellation.
       };
       const ctx={get:key=>key==='agents'?{get:()=>({})}:
-        key==='skills'?{list:async({signal})=>{lookupSignal=signal;return [{name:'doc',invocation:{modelInvocable:true}}];}}:
+        key==='skills'?{list:async({signal})=>{lookupSignal=signal;return [{name:'doc',invocation:{modelInvocable:true,userInvocable:true}}];}}:
         key==='fileReferences'?{list:async()=>[]}:undefined};
       const result=await forgePrompt(ctx,DEFAULT_STATE,'Review.',{},'s');
       return {result,calls,nominationAborted:modelSignal.aborted,validationAborted:lookupSignal.aborted};
@@ -1180,7 +1181,7 @@ for (const scenario of [
       let calls=0;
       callModel=async()=>{calls++;return JSON.stringify({prompt:'Review.',files:['src/host.js'],skills:['doc']});};
       const ctx={get:key=>key==='agents'?{get:()=>({})}:
-        key==='skills'?{list:async()=>[{name:'doc',invocation:{modelInvocable:true}}]}:
+        key==='skills'?{list:async()=>[{name:'doc',invocation:{modelInvocable:true,userInvocable:true}}]}:
         key==='fileReferences'?{list:async()=>new Promise(()=>{})}:undefined};
       const result=await forgePrompt(ctx,DEFAULT_STATE,'Review.',{},'s');
       return {result,calls};
@@ -1257,7 +1258,7 @@ for (const scenario of [
   const result = await callRoute(routes.get('/prompt-forge/optimize'), {
     body: { text: '帮我写一份简历', sessionId: 'session-1' },
   });
-  check('a résumé request reaches the office skill through the candidate catalog', () => {
+  check('a résumé request reaches the skill as a /command the agent can load', () => {
     assert.equal(result.status, 200, `unexpected body: ${result.body}`);
     assert.equal(llm.calls.length, 2, 'an empty skill list is worth one question');
     const question = llm.calls[1].messages[0].content[0].text;
@@ -1265,8 +1266,43 @@ for (const scenario of [
     assert.match(question, /office-docx/, 'the catalog must reach the question');
     assert.doesNotMatch(question, /human-only/, 'a human-only skill is never offered');
     assert.deepEqual(result.json.skills, ['office-docx']);
-    assert.match(result.json.prompt, /office-docx/);
+    /* The appended row is the gesture DSH scans for in a user message; a bare
+       name would leave the agent to find the skill on its own. */
+    assert.equal(result.json.prompt,
+      '使用可用的相关技能，为我撰写一份简历。\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx');
+    assert.match(result.json.prompt, /^\/office-docx$/mu, 'the row must be its own line, slash-prefixed');
     assert.equal(result.json.referenceStatus, 'complete');
+  });
+}
+
+/* --- 8f. the appended rows are the gesture the skill loader reads -------- */
+{
+  /* These assertions mirror `dsh-tool-skill`'s own scanner: `/(^|\s)\/([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)/`.
+     A row that cannot match it is a row DSH will never turn into a skill load. */
+  const gesture = /(^|\s)\/([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)/gu;
+  await freshHome();
+  const llm = makeLlm(JSON.stringify({ prompt: 'Write a résumé.', files: [], skills: ['great-resume', 'Not_A_Skill', 'office-docx'] }));
+  const workspace = await makeWorkspaceFixture();
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    fileReferences: makeFileIndex(),
+    skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent(workspace) },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: 'write a résumé', sessionId: 'session-1' },
+  });
+  const rows = result.json.prompt.split('\n').filter((line) => line.startsWith('/'));
+  check('every appended skill row is a gesture DSH loads, and the rest are dropped', () => {
+    assert.ok(rows.length > 0, `no gesture rows in: ${result.json.prompt}`);
+    for (const row of rows) {
+      const matched = [...row.matchAll(gesture)].map((match) => match[2]);
+      assert.deepEqual(matched, [row.slice(1)], `row ${row} must match the skill gesture grammar`);
+    }
+    assert.deepEqual(result.json.skills, ['office-docx'], 'a name the grammar cannot carry is not appended');
   });
 }
 

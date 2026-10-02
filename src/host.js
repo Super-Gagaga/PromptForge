@@ -566,21 +566,25 @@ async function resolveSkillReferences(hostCtx, agent, cwd, nominations, signal) 
   const catalog = await withSignal(() => service.list({ scope: agent, ...(cwd === undefined ? {} : { cwd }), signal }), signal);
   const wanted = new Set(nominations.slice(0, MAX_SKILL_NOMINATIONS).map((name) => name.trim()));
   return catalog
-    .filter((skill) => wanted.has(skill.name) && skill.invocation?.modelInvocable === true)
+    /* Both policies must allow it: the block tells the agent it may load the
+       skill, and DSH only loads a `/name` gesture whose skill is user-invocable. */
+    .filter((skill) => wanted.has(skill.name)
+      && skill.invocation?.modelInvocable === true
+      && skill.invocation?.userInvocable === true)
     .map((skill) => ({ name: skill.name, description: skill.description }));
 }
 
 /**
- * List the skills this agent can actually load.
+ * List the skills this agent can load, as candidates for the nomination question.
  *
  * The nomination question can only choose a skill it can see, and a model has no
  * way to read the catalog itself — asked to name skills unaided, it correctly
  * answers "none" rather than guess. Files already get a real-path listing for
  * exactly this reason; skills need the same, or a request like "write me a
- * résumé" never reaches the office skill that exists for it.
+ * résumé" never reaches the skill that exists for it.
  *
- * Only model-invocable entries are listed: the reference block tells the agent to
- * load one with its `skill` tool, so a human-only skill would be a dead end.
+ * Both invocation policies are required: the agent may load the entry, and DSH
+ * will honour the `/name` gesture the reference block writes.
  *
  * @param hostCtx - host context carrying the optional skills service.
  * @param agent - live agent whose scope and working directory select the layers.
@@ -594,7 +598,7 @@ async function listAvailableSkills(hostCtx, agent, cwd, signal) {
   try {
     const catalog = await withSignal(() => service.list({ scope: agent, ...(cwd === undefined ? {} : { cwd }), signal }), signal);
     return catalog
-      .filter((skill) => skill.invocation?.modelInvocable === true)
+      .filter((skill) => skill.invocation?.modelInvocable === true && skill.invocation?.userInvocable === true)
       .slice(0, CANDIDATE_SKILL_BUDGET)
       .map((skill) => (typeof skill.description === 'string' && skill.description !== ''
         ? `${skill.name} — ${skill.description}`
@@ -677,9 +681,13 @@ function appendReferences(prompt, files, skills) {
     acceptedFiles.push(file);
   }
   for (const skill of skills) {
-    if (knownSkills.has(skill.name)) continue;
-    knownSkills.add(skill.name);
-    if (render().length > MAX_INPUT_CHARS) { knownSkills.delete(skill.name); continue; }
+    /* The block carries gestures, not bare names: `/name` is what DSH turns into
+       a skill load when the user sends the prompt. A name its grammar cannot
+       carry is dropped rather than appended as a token that does nothing. */
+    const gesture = formatSkillGesture(skill.name);
+    if (gesture === undefined || knownSkills.has(gesture)) continue;
+    knownSkills.add(gesture);
+    if (render().length > MAX_INPUT_CHARS) { knownSkills.delete(gesture); continue; }
     acceptedSkills.push(skill);
   }
   const result = render();
@@ -687,7 +695,7 @@ function appendReferences(prompt, files, skills) {
   if (result.length > MAX_INPUT_CHARS) return { prompt, files: [], skills: [], limited: true };
   return { prompt: result, files: acceptedFiles, skills: acceptedSkills,
     limited: files.some((file) => !mentions.has(normalizeQuery(file.token)))
-      || skills.some((skill) => !knownSkills.has(skill.name)) };
+      || skills.some((skill) => !knownSkills.has(formatSkillGesture(skill.name))) };
 }
 
 /**
