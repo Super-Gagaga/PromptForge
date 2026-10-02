@@ -55,6 +55,18 @@ const zh = {
   'action.aria': '优化提示词（不发送）',
   'action.busy': '正在优化提示词…',
   'action.failed': '优化失败：{message}',
+  'action.appended': '已追加{parts}。',
+  'action.appendedJoin': '、',
+  'action.appendedFiles': ' {count} 个文件引用',
+  'action.appendedSkills': ' {count} 个技能引用',
+  'reference.heading': '自动引用',
+  'reference.hint': '优化完成后，把这次改写真正依赖的文件与技能追加到提示词末尾。',
+  'reference.files': '引用文件',
+  'reference.filesHint': '由模型提名、再经当前工作区的文件索引校验；只保留真实存在的路径。',
+  'reference.skills': '引用技能',
+  'reference.skillsHint': '由模型提名、再经技能目录校验；命中的技能会以名称列出。',
+  'toggle.on': '开',
+  'toggle.off': '关',
   'nav': '提示词优化',
   'intro': '在输入框旁点击优化按钮，当前草稿就会被重写成更清晰的提示词。优化结果只替换输入框内容，不会自动发送。',
   'model.heading': '模型',
@@ -93,6 +105,18 @@ const en = {
   'action.aria': 'Optimize prompt (does not send)',
   'action.busy': 'Optimizing prompt…',
   'action.failed': 'Optimization failed: {message}',
+  'action.appended': 'Appended{parts}.',
+  'action.appendedJoin': ' and',
+  'action.appendedFiles': ' {count} file reference(s)',
+  'action.appendedSkills': ' {count} skill reference(s)',
+  'reference.heading': 'Automatic references',
+  'reference.hint': 'After a rewrite, append the files and skills that rewrite actually depends on.',
+  'reference.files': 'Reference files',
+  'reference.filesHint': 'The model nominates paths and the workspace file index confirms them; only paths that really exist survive.',
+  'reference.skills': 'Reference skills',
+  'reference.skillsHint': 'The model nominates names and the skill catalog confirms them; matches are listed by name.',
+  'toggle.on': 'On',
+  'toggle.off': 'Off',
   'nav': 'Prompt Forge',
   'intro': 'Click the text-and-spark button beside the composer and the current draft is rewritten into a clearer prompt. The result only replaces the composer text — it is never sent for you.',
   'model.heading': 'Model',
@@ -192,6 +216,17 @@ const CSS = `
 .PF-optionCopy{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .PF-optionCheck{flex:none;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary)}
 .PF-menuHint{padding:6px 10px 2px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.PF-toggle{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.PF-toggleCopy{display:flex;flex-direction:column;gap:2px;min-width:0}
+.PF-toggleLabel{color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
+.PF-switch{display:inline-flex;align-items:center;gap:8px;flex:none;padding:2px 0;border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}
+.PF-switch:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}
+.PF-switch:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px;border-radius:var(--dsw-radius-sm)}
+.PF-switchTrack{box-sizing:border-box;display:inline-block;position:relative;width:34px;height:20px;flex:none;border-radius:10px;background:var(--dsw-alias-border-l2);transition:background-color .12s var(--ds-ease-in-out, ease)}
+.PF-switch[data-on=true] .PF-switchTrack{background:var(--dsw-alias-state-business-primary)}
+.PF-switchThumb{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--dsw-static-neutral-00);transition:transform .12s var(--ds-ease-in-out, ease)}
+.PF-switch[data-on=true] .PF-switchThumb{transform:translateX(14px)}
+.PF-switchState{min-width:1.5em;text-align:right}
 .PF-status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-caption)}
 .PF-status[data-tone=error]{color:var(--dsw-alias-state-error-primary)}
 .PF-status[data-tone=ok]{color:var(--dsw-alias-state-success-primary)}
@@ -479,6 +514,9 @@ function PromptForgeButton(props) {
   const draftRev = useInput((state) => state.draftRev);
   const [busy, setBusy] = ReactRuntime.useState(false);
   const [failed, setFailed] = ReactRuntime.useState(false);
+  /* What the last successful rewrite appended, or null when there is nothing to
+     report. The button shows it briefly instead of changing the draft again. */
+  const [appended, setAppended] = ReactRuntime.useState(null);
   /* The draft this component last rendered: the async callback compares against
      it so a reply can never overwrite text the user changed or sent mid-flight. */
   const latest = ReactRuntime.useRef(null);
@@ -499,6 +537,12 @@ function PromptForgeButton(props) {
     return () => clearTimeout(timer);
   }, [failed]);
 
+  ReactRuntime.useEffect(() => {
+    if (appended === null) return undefined;
+    const timer = setTimeout(() => setAppended(null), 4000);
+    return () => clearTimeout(timer);
+  }, [appended]);
+
   const run = async () => {
     if (running.current || busy || locked || !hasText) return;
     const text = draft;
@@ -506,11 +550,12 @@ function PromptForgeButton(props) {
     running.current = true;
     setBusy(true);
     setFailed(false);
+    setAppended(null);
     try {
       const response = await fetch(OPTIMIZE_ROUTE, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, sessionId }),
       });
       const body = await response.json().catch(() => null);
       if (!response.ok || body === null || typeof body.prompt !== 'string' || body.prompt.trim() === '') {
@@ -525,6 +570,11 @@ function PromptForgeButton(props) {
       }
       inputActions.setDraft(body.prompt);
       setLastFailure(null);
+      /* Report what was appended so an added reference is never a surprise. */
+      setAppended({
+        files: Array.isArray(body.files) ? body.files.length : 0,
+        skills: Array.isArray(body.skills) ? body.skills.length : 0,
+      });
       setBusy(false);
     } catch (error) {
       const message = String(error?.message ?? error);
@@ -546,7 +596,7 @@ function PromptForgeButton(props) {
 
   const tip = busy
     ? t('action.busy')
-    : failed ? t('action.failed', { message: lastFailure ?? '' }) : t('action.title');
+    : failed ? t('action.failed', { message: lastFailure ?? '' }) : appendedTip(t, appended) ?? t('action.title');
   return ReactRuntime.createElement(Tooltip, {
     label: tip,
     side: 'top',
@@ -576,6 +626,22 @@ function effortName(reasoning, effort, t) {
   if (effort === '') return t('effort.default');
   const level = reasoning?.efforts?.find((candidate) => candidate.id === effort);
   return level?.name ?? effort;
+}
+
+/**
+ * Render what the last rewrite appended, in the user's own language.
+ *
+ * @param t - namespace translator.
+ * @param appended - `{files, skills}` counts, or null when there is nothing.
+ * @returns the tooltip sentence, or undefined when the plain title should stand.
+ */
+function appendedTip(t, appended) {
+  if (appended === null) return undefined;
+  const files = appended.files > 0 ? t('action.appendedFiles', { count: appended.files }) : '';
+  const skills = appended.skills > 0 ? t('action.appendedSkills', { count: appended.skills }) : '';
+  const parts = [files, skills].filter((part) => part !== '');
+  if (parts.length === 0) return undefined;
+  return t('action.appended', { parts: parts.join(t('action.appendedJoin')) });
 }
 
 /* -------------------------------------------------------------- pickers */
@@ -768,6 +834,40 @@ function Section(props) {
   ]);
 }
 
+/**
+ * One on/off preference row in the settings page.
+ *
+ * The control is a real `role="switch"` button with `aria-checked`, so it is
+ * reachable and legible to assistive technology without shipping a second
+ * checkbox style.
+ */
+function ReferenceToggle(props) {
+  const { label, hint, checked, disabled, onLabel, offLabel, onChange } = props;
+  return ReactRuntime.createElement('div', { className: 'PF-toggle' }, [
+    ReactRuntime.createElement('div', { key: 'copy', className: 'PF-toggleCopy' }, [
+      ReactRuntime.createElement('span', { key: 'label', className: 'PF-toggleLabel' }, label),
+      hint === undefined ? null : ReactRuntime.createElement('span', { key: 'hint', className: 'PF-hint' }, hint),
+    ]),
+    ReactRuntime.createElement('button', {
+      key: 'switch',
+      type: 'button',
+      role: 'switch',
+      className: 'PF-switch',
+      'aria-checked': checked === true,
+      'aria-label': label,
+      disabled: disabled === true,
+      'data-on': checked === true ? 'true' : 'false',
+      onClick: () => onChange(checked !== true),
+    }, [
+      ReactRuntime.createElement('span', { key: 'track', className: 'PF-switchTrack' }, [
+        ReactRuntime.createElement('span', { key: 'thumb', className: 'PF-switchThumb' }),
+      ]),
+      ReactRuntime.createElement('span', { key: 'state', className: 'PF-switchState' },
+        checked === true ? onLabel : offLabel),
+    ]),
+  ]);
+}
+
 /** The PromptForge settings page. */
 function PromptForgeSettings(props) {
   const t = props.t;
@@ -861,6 +961,33 @@ function PromptForgeSettings(props) {
         })),
       ])),
       ReactRuntime.createElement('p', { key: 'note', className: 'PF-hint' }, t('effort.followUp')),
+    ]),
+
+    ReactRuntime.createElement(Section, {
+      key: 'reference',
+      title: t('reference.heading'),
+      hint: t('reference.hint'),
+    }, [
+      ReactRuntime.createElement(ReferenceToggle, {
+        key: 'files',
+        label: t('reference.files'),
+        hint: t('reference.filesHint'),
+        checked: settings?.referenceFiles !== false,
+        disabled: settings === undefined,
+        onLabel: t('toggle.on'),
+        offLabel: t('toggle.off'),
+        onChange: (next) => settingsStore.patch({ referenceFiles: next }),
+      }),
+      ReactRuntime.createElement(ReferenceToggle, {
+        key: 'skills',
+        label: t('reference.skills'),
+        hint: t('reference.skillsHint'),
+        checked: settings?.referenceSkills !== false,
+        disabled: settings === undefined,
+        onLabel: t('toggle.on'),
+        offLabel: t('toggle.off'),
+        onChange: (next) => settingsStore.patch({ referenceSkills: next }),
+      }),
     ]),
 
     ReactRuntime.createElement(Section, {

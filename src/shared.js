@@ -27,8 +27,83 @@ const MAX_OUTPUT_TOKENS = 4096;
 /** One optimization call must settle within this many milliseconds. */
 const REQUEST_TIMEOUT_MS = 120000;
 
+/** The post-request reference lookups get their own, much shorter deadline. */
+const REFERENCE_TIMEOUT_MS = 15000;
+
+/** Upper bound on file paths the model may nominate for one rewrite. */
+const MAX_FILE_NOMINATIONS = 5;
+
+/** Upper bound on skill names the model may nominate for one rewrite. */
+const MAX_SKILL_NOMINATIONS = 3;
+
 /** Appended to the composer output when the model produced nothing usable. */
 const EMPTY_OUTPUT_MESSAGE = 'prompt-forge: the model returned no usable prompt text';
+
+/**
+ * Marker opening the appended skill-reference block.
+ *
+ * A skill is not a path: DSH loads one through the model-facing `skill` tool,
+ * keyed by name. The block therefore names the skills the rewrite depends on and
+ * says how to load them, instead of inventing a text token the agent would not
+ * understand.
+ */
+const SKILL_REFERENCE_MARKER = 'Skills this task may need (load one with the skill tool by name):';
+
+/* ---------------------------------------------------------- reference syntax */
+
+/**
+ * Render one workspace path as the reference token DSH's composer grammar
+ * recognizes, or `undefined` for a path that grammar cannot represent safely.
+ *
+ * This mirrors `formatFileMention` in `@deepseek-ai/dsh-file-reference/grammar`:
+ * `@path` normally, `@"path"` when the path contains whitespace, `@"dir` for a
+ * directory the user is meant to list, and no token at all when the path carries
+ * a character the editor cannot quote.
+ *
+ * @param path - workspace-relative path, already normalized to `/`.
+ * @param kind - file or directory, as the file-reference index reported it.
+ * @returns the reference token, or `undefined` when it cannot be rendered.
+ */
+function formatFileMention(path, kind) {
+  if (typeof path !== 'string' || path === '') return undefined;
+  if (/[\u0000-\u001f\u007f-\u009f"]/u.test(path)) return undefined;
+  const suffix = kind === 'directory' ? '/' : '';
+  const target = `${path}${suffix}`;
+  if (!/\s/u.test(target)) return `@${target}`;
+  return kind === 'directory' ? `@"${target}` : `@"${target}"`;
+}
+
+/**
+ * The rewrite envelope instruction appended when the rewrite must also nominate
+ * the files and skills it depends on.
+ *
+ * The model never writes a reference token itself: it names paths and skill
+ * names, and the Host validates every nomination against the live file index and
+ * skill catalog before anything reaches the composer. That split is what keeps a
+ * hallucinated path out of the prompt.
+ *
+ * @param files - whether file nominations are collected.
+ * @param skills - whether skill nominations are collected.
+ * @returns the instruction, or an empty string when neither is enabled.
+ */
+function buildEnvelopeInstruction(files, skills) {
+  if (!files && !skills) return '';
+  const fields = ['"prompt": string — the rewritten prompt'];
+  if (files) fields.push('"files": string[] — workspace-relative paths, or distinctive path fragments');
+  if (skills) fields.push('"skills": string[] — kebab-case names of skills this task needs');
+  const rules = [
+    'Reply with ONE JSON object and nothing else. No prose, no code fence, no trailing text.',
+    `Shape: { ${fields.join(', ')} }.`,
+  ];
+  if (files) {
+    rules.push('For "files": list only files this task genuinely depends on, most relevant first, at most 5. Give the most specific path you can justify from the request; when you cannot name a real path, use a distinctive fragment of one. Never invent a file you have no reason to believe exists, and never list a file the request does not need.');
+  }
+  if (skills) {
+    rules.push('For "skills": list only skills you are confident exist and that this task needs, at most 3. Use an empty array when none apply.');
+  }
+  rules.push('Include every field even when it is empty, and prefer an empty list over a guess.');
+  return `\n\n${rules.join('\n')}`;
+}
 
 /**
  * The rewrite instruction. Placeholders keep the two variable parts (the text
@@ -66,12 +141,17 @@ Output contract:
 function normalizeState(input) {
   const source = input !== null && typeof input === 'object' ? input : {};
   const text = (value) => (typeof value === 'string' ? value : '');
+  const flag = (value, fallback) => (typeof value === 'boolean' ? value : fallback);
   const systemPrompt = text(source.systemPrompt).trim();
   return {
     provider: text(source.provider).trim(),
     model: text(source.model).trim(),
     reasoningEffort: text(source.reasoningEffort).trim(),
     systemPrompt: systemPrompt === '' ? DEFAULT_SYSTEM_PROMPT : systemPrompt,
+    /* Both reference features are opt-out: an older document without the fields
+       keeps them enabled, which is what a fresh install gets too. */
+    referenceFiles: flag(source.referenceFiles, true),
+    referenceSkills: flag(source.referenceSkills, true),
   };
 }
 

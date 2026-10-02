@@ -207,22 +207,190 @@ function accumulateText() {
 }
 
 /**
+ * Read the model's rewrite answer, tolerating both envelope shapes.
+ *
+ * A model that was asked for the JSON envelope usually returns it, but a
+ * provider may wrap it in a code fence or ignore the instruction entirely. A
+ * plain-text answer is still a usable rewrite, so it degrades to one instead of
+ * failing the request.
+ *
+ * @param text - the assistant text exactly as streamed.
+ * @returns the rewrite plus any nominated paths and skill names.
+ */
+function readRewriteAnswer(text) {
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/u.exec(trimmed);
+  const body = fenced === null ? trimmed : fenced[1];
+  const start = body.indexOf('{');
+  if (start !== -1) {
+    const end = body.lastIndexOf('}');
+    if (end > start) {
+      try {
+        const parsed = JSON.parse(body.slice(start, end + 1));
+        if (parsed !== null && typeof parsed === 'object' && typeof parsed.prompt === 'string') {
+          return {
+            prompt: parsed.prompt,
+            files: Array.isArray(parsed.files) ? parsed.files.filter((item) => typeof item === 'string') : [],
+            skills: Array.isArray(parsed.skills) ? parsed.skills.filter((item) => typeof item === 'string') : [],
+          };
+        }
+      } catch {
+        /* Not JSON after all: the whole answer is the rewrite. */
+      }
+    }
+  }
+  return { prompt: trimmed, files: [], skills: [] };
+}
+
+/** Normalize one model-nominated path into the shape the file index speaks. */
+function normalizeQuery(value) {
+  return value
+    .trim()
+    .replaceAll('\\', '/')
+    .replace(/^\.\/+/u, '')
+    .replace(/^@/u, '')
+    .replace(/^"+|"+$/gu, '');
+}
+
+/**
+ * Decide whether one index candidate answers a nomination.
+ *
+ * The model names a fragment, not a resolved path, so equality cannot be the
+ * test. A fragment must still land on a segment boundary: `host` matches
+ * `src/host.js`, while `ost` matches nothing. Mid-segment matches are refused on
+ * purpose, because they are how one nomination would silently resolve to an
+ * unrelated file in a deep tree.
+ *
+ * @param path - candidate path from the index.
+ * @param query - normalized nomination.
+ * @returns whether the candidate answers it.
+ */
+function nominationMatches(path, query) {
+  if (query === '') return false;
+  return path.startsWith(query)
+    || path.includes(`/${query}`)
+    || path.includes(`${query}/`);
+}
+
+/**
+ * Resolve model-nominated paths against the live file index.
+ *
+ * The model's own token never reaches the composer: a nomination survives only
+ * when the index answers it, and an exact path beats a partial one. That check
+ * is what makes a hallucinated path impossible, and it also produces the
+ * canonical path the reference token must use.
+ *
+ * @param hostCtx - host context carrying the optional file-reference service.
+ * @param agent - live agent whose working directory bounds discovery.
+ * @param nominations - model-proposed paths or path fragments.
+ * @param signal - cancellation for the lookups.
+ * @returns validated `{ path, kind, token }` entries, most relevant first.
+ */
+async function resolveFileReferences(hostCtx, agent, nominations, signal) {
+  const service = hostCtx.get('fileReferences');
+  if (service === undefined || agent === undefined) {
+    throw new Error('file references are unavailable: this composition has no file-reference index for the session');
+  }
+  const resolved = [];
+  const seen = new Set();
+  for (const nomination of nominations.slice(0, MAX_FILE_NOMINATIONS)) {
+    const query = normalizeQuery(nomination);
+    if (query === '') continue;
+    let candidates;
+    try {
+      candidates = await service.list(agent, query, signal);
+    } catch {
+      /* One failed lookup drops its own nomination only. */
+      continue;
+    }
+    const stem = query.replace(/\/+$/u, '');
+    const matches = candidates.filter((candidate) => nominationMatches(candidate.path, stem));
+    /* An exact hit is canonical; otherwise the index's own ranking decides, so
+       the first match wins rather than a guess across the whole answer. */
+    const chosen = matches.find((candidate) => candidate.path === stem) ?? matches[0];
+    if (chosen === undefined) continue;
+    const token = formatFileMention(chosen.path, chosen.kind);
+    if (token === undefined || seen.has(token)) continue;
+    seen.add(token);
+    resolved.push({ path: chosen.path, kind: chosen.kind, token });
+  }
+  return resolved;
+}
+
+/**
+ * Resolve model-nominated skill names against the live skill catalog.
+ *
+ * Names are matched exactly against the layers this exact agent sees, and only
+ * model-invocable skills survive: the block tells the agent to load the skill
+ * through its `skill` tool, so advertising a human-only skill would be a dead
+ * end. This mirrors how the shipped Session skill catalog builds its own view.
+ *
+ * @param hostCtx - host context carrying the optional skills service.
+ * @param agent - live agent whose scope and working directory select the layers.
+ * @param cwd - the Session's working directory, when known.
+ * @param nominations - model-proposed skill names.
+ * @param signal - cancellation for discovery.
+ * @returns validated `{ name, description }` entries, catalog order.
+ */
+async function resolveSkillReferences(hostCtx, agent, cwd, nominations, signal) {
+  if (agent === undefined) {
+    throw new Error('skill references are unavailable: this composition has no live agent for the session');
+  }
+  const service = hostCtx.get('skills');
+  if (service === undefined) {
+    throw new Error('skill references are unavailable: this composition has no skill catalog');
+  }
+  const catalog = await service.list({ scope: agent, ...(cwd === undefined ? {} : { cwd }), signal });
+  const wanted = new Set(nominations.slice(0, MAX_SKILL_NOMINATIONS).map((name) => name.trim()));
+  return catalog
+    .filter((skill) => wanted.has(skill.name) && skill.invocation?.modelInvocable === true)
+    .map((skill) => ({ name: skill.name, description: skill.description }));
+}
+
+/**
+ * Append the validated references to a rewrite.
+ *
+ * References land on their own lines at the very end. The composer's mention
+ * grammar needs `@` at a line start or after whitespace, and appending keeps a
+ * leading slash command or mention exactly where the author had it — the rewrite
+ * contract already forbids moving it.
+ *
+ * @param prompt - the rewritten prompt.
+ * @param files - validated file references.
+ * @param skills - validated skill references.
+ * @returns the prompt with its reference block, or unchanged when there is none.
+ */
+function appendReferences(prompt, files, skills) {
+  const blocks = [prompt];
+  if (files.length > 0) {
+    blocks.push(files.map((file) => file.token).join('\n'));
+  }
+  if (skills.length > 0) {
+    blocks.push(`${SKILL_REFERENCE_MARKER}\n${skills.map((skill) => skill.name).join('\n')}`);
+  }
+  return blocks.join('\n\n');
+}
+
+/**
  * Rewrite one draft into an optimized prompt with an existing DSH model.
  *
  * @param ctx - host context, read for the deployment default model.
  * @param state - current settings document.
  * @param text - exact composer draft to rewrite.
  * @param llm - the live LLM service to call.
- * @returns the rewritten prompt plus the route that produced it.
+ * @param sessionId - Session whose working directory bounds reference discovery.
+ * @returns the rewritten prompt, the route, and the appended reference counts.
  * @throws when the model is unroutable, the call fails, or the output is unusable.
  */
-async function forgePrompt(ctx, state, text, llm) {
+async function forgePrompt(ctx, state, text, llm, sessionId) {
   const trimmed = text.trim();
   if (trimmed === '') throw new Error('there is nothing to optimize');
   if (text.length > MAX_INPUT_CHARS) {
     throw new Error(`the draft is ${text.length} characters; the limit is ${MAX_INPUT_CHARS}`);
   }
   const route = resolveRoute(llm, ctx.get('agentDefaultModel'), state);
+  const wantFiles = state.referenceFiles;
+  const wantSkills = state.referenceSkills;
   /* A request-only user input: no id/source is needed because this call never
      enters a Session log. */
   const messages = [{
@@ -236,7 +404,7 @@ async function forgePrompt(ctx, state, text, llm) {
     provider: route.provider,
     model: route.model,
     messages,
-    system: state.systemPrompt,
+    system: `${state.systemPrompt}${buildEnvelopeInstruction(wantFiles, wantSkills)}`,
     maxTokens: MAX_OUTPUT_TOKENS,
     purpose: 'prompt-forge',
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -251,12 +419,45 @@ async function forgePrompt(ctx, state, text, llm) {
   if (assembler.openedToolCall()) {
     throw new Error('the model returned a tool call instead of prompt text');
   }
-  const prompt = assembler.text();
-  if (prompt === '') throw new Error(EMPTY_OUTPUT_MESSAGE);
-  if (prompt.length > MAX_INPUT_CHARS) {
+  const answer = readRewriteAnswer(assembler.text());
+  if (answer.prompt === '') throw new Error(EMPTY_OUTPUT_MESSAGE);
+  if (answer.prompt.length > MAX_INPUT_CHARS) {
     throw new Error('the optimized prompt came back longer than the composer limit');
   }
-  return { prompt, route };
+
+  /* Reference resolution is best-effort: a composition without the index, a
+     session with no live agent, or a failing lookup must never cost the user the
+     rewrite they asked for.
+     It gets its own deadline rather than the model call's signal: that one is
+     already consumed by the finished stream, and a post-request lookup must not
+     inherit the model's remaining budget. */
+  const agent = ctx.get('agents')?.get(sessionId);
+  const cwd = agent?.ctx?.get('session')?.cwd;
+  const referenceSignal = AbortSignal.timeout(REFERENCE_TIMEOUT_MS);
+  const notes = [];
+  let files = [];
+  let skills = [];
+  if (wantFiles && answer.files.length > 0) {
+    try {
+      files = await resolveFileReferences(ctx, agent, answer.files, referenceSignal);
+    } catch (error) {
+      notes.push(String(error?.message ?? error));
+    }
+  }
+  if (wantSkills && answer.skills.length > 0) {
+    try {
+      skills = await resolveSkillReferences(ctx, agent, cwd, answer.skills, referenceSignal);
+    } catch (error) {
+      notes.push(String(error?.message ?? error));
+    }
+  }
+  return {
+    prompt: appendReferences(answer.prompt, files, skills),
+    route,
+    files: files.map((file) => file.path),
+    skills: skills.map((skill) => skill.name),
+    ...(notes.length === 0 ? {} : { notes }),
+  };
 }
 
 /* -------------------------------------------------------------- plugin body */
@@ -340,9 +541,10 @@ function apply(ctx) {
           readJsonBody(req).then(
             async (body) => {
               const text = typeof body.text === 'string' ? body.text : '';
+              const sessionId = typeof body.sessionId === 'string' ? body.sessionId : '';
               try {
                 const llm = llmCtx();
-                const result = await forgePrompt(ctx, live.state, text, llm);
+                const result = await forgePrompt(ctx, live.state, text, llm, sessionId);
                 sendJson(res, 200, result);
               } catch (error) {
                 sendJson(res, 400, { error: String(error?.message ?? error) });

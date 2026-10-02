@@ -440,6 +440,53 @@ function makeLlm(text, { emit } = {}) {
   };
 }
 
+/** The workspace paths the fake file index knows about. */
+const INDEX_PATHS = [
+  { path: 'src/host.js', kind: 'file' },
+  { path: 'src/my module.js', kind: 'file' },
+  { path: 'src/pages', kind: 'directory' },
+];
+
+/**
+ * A fake file-reference index: it answers a query with every known path that
+ * contains it, exactly as the fuzzy workspace search ranks candidates.
+ */
+function makeFileIndex() {
+  const queries = [];
+  return {
+    queries,
+    list: async (agent, query) => {
+      queries.push({ agent, query });
+      if (agent === undefined) throw new Error('no agent');
+      return INDEX_PATHS.filter((candidate) => candidate.path.includes(query));
+    },
+  };
+}
+
+/** A fake skill catalog. */
+function makeSkillCatalog() {
+  const queried = [];
+  const skills = [
+    { name: 'office-docx', description: 'Word documents', invocation: { modelInvocable: true, userInvocable: true }, source: 'bundled', provider: 'skill-filesystem' },
+    { name: 'office-xlsx', description: 'Spreadsheets', invocation: { modelInvocable: true, userInvocable: true }, source: 'bundled', provider: 'skill-filesystem' },
+    /* Human-only: the model cannot load it, so it must never be advertised. */
+    { name: 'human-only', description: 'Command only', invocation: { modelInvocable: false, userInvocable: true }, source: 'bundled', provider: 'skill-filesystem' },
+  ];
+  return {
+    queried,
+    list: async (options) => {
+      queried.push(options);
+      return skills;
+    },
+  };
+}
+
+/** One live agent stand-in, with the session its skill lookup reads. */
+function makeAgent() {
+  const session = { cwd: 'C:/work' };
+  return { id: 'session-1', ctx: { get: (service) => (service === 'session' ? session : undefined) } };
+}
+
 /* -------------------------------------------------------------------- checks */
 
 process.stdout.write('dsh-prompt-forge self-check\n');
@@ -558,7 +605,107 @@ check('Host half exports apply/inject/name', () => {
   });
 }
 
-/* --- 5. the browser half loads and registers its two seats --------------- */
+/* --- 5. the reference pass validates before it appends ------------------- */
+for (const [label, answer, expectations] of [
+  [
+    'appends a confirmed file, quotes a spaced path, drops a hallucination, and lists a confirmed skill',
+    {
+      prompt: 'Fix the login flow.',
+      files: ['src/host', 'my module', 'src/does-not-exist'],
+      skills: ['office-docx', 'human-only', 'invented-skill'],
+    },
+    {
+      prompt: 'Fix the login flow.\n\n@src/host.js\n@"src/my module.js"\n\nSkills this task may need (load one with the skill tool by name):\noffice-docx',
+      files: ['src/host.js', 'src/my module.js'],
+      skills: ['office-docx'],
+      queried: ['src/host', 'my module', 'src/does-not-exist'],
+    },
+  ],
+  [
+    'keeps the rewrite when the model nominates nothing',
+    { prompt: 'Fix the login flow.', files: [], skills: [] },
+    { prompt: 'Fix the login flow.', files: [], skills: [], queried: [] },
+  ],
+  [
+    'accepts a plain-text answer when the model ignores the envelope',
+    'Fix the login flow.',
+    { prompt: 'Fix the login flow.', files: [], skills: [], queried: [] },
+  ],
+  [
+    'accepts a fenced JSON answer',
+    '```json\n{"prompt":"Fix the login flow.","files":["src/host"],"skills":[]}\n```',
+    { prompt: 'Fix the login flow.\n\n@src/host.js', files: ['src/host.js'], skills: [], queried: ['src/host'] },
+  ],
+]) {
+  await freshHome();
+  const llm = makeLlm(typeof answer === 'string' ? answer : JSON.stringify(answer));
+  const index = makeFileIndex();
+  const catalog = makeSkillCatalog();
+  const agent = makeAgent();
+  const services = {
+    llm,
+    webServer: {},
+    fileReferences: index,
+    skills: catalog,
+    agents: { get: (id) => (id === 'session-1' ? agent : undefined) },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  };
+  const { ctx, routes } = makeHostContext(services);
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: 'fix the login flow', sessionId: 'session-1' },
+  });
+  check(`the reference pass ${label}`, () => {
+    assert.equal(result.status, 200, `unexpected body: ${result.body}`);
+    assert.equal(result.json.prompt, expectations.prompt);
+    assert.deepEqual(result.json.files, expectations.files);
+    assert.deepEqual(result.json.skills, expectations.skills);
+    assert.deepEqual(index.queries.map((query) => query.query), expectations.queried);
+    assert.equal(result.json.notes, undefined, 'a healthy pass records no note');
+    if (expectations.queried.length > 0) {
+      assert.equal(index.queries[0].agent, agent, 'discovery must be scoped to the live agent');
+    }
+    if (result.json.skills.length > 0) {
+      assert.equal(catalog.queried.at(-1).scope, agent, 'the catalog view must be scoped to the live agent');
+      assert.equal(catalog.queried.at(-1).cwd, 'C:/work', 'the catalog view must use the Session working directory');
+    }
+  });
+}
+
+/* --- 6. the envelope instruction follows the two toggles ----------------- */
+{
+  await freshHome();
+  const llm = makeLlm(JSON.stringify({ prompt: 'Rewritten.', files: [], skills: [] }));
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    fileReferences: makeFileIndex(),
+    skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent() },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  const off = await callRoute(routes.get('/prompt-forge/state'), {
+    body: { referenceFiles: false, referenceSkills: false },
+  });
+  check('both reference toggles default to on and persist when switched off', () => {
+    assert.equal(off.status, 200);
+    assert.equal(off.json.referenceFiles, false);
+    assert.equal(off.json.referenceSkills, false);
+  });
+
+  const withFiles = await callRoute(routes.get('/prompt-forge/state'), { body: { referenceFiles: true } });
+  await callRoute(routes.get('/prompt-forge/optimize'), { body: { text: 'hi', sessionId: 'session-1' } });
+  const instruction = llm.calls.at(-1).system;
+  check('the envelope instruction asks only for what the toggles enabled', () => {
+    assert.equal(withFiles.json.referenceFiles, true);
+    assert.equal(withFiles.json.referenceSkills, false);
+    assert.match(instruction, /"files"/);
+    assert.doesNotMatch(instruction, /"skills"/, 'a disabled feature must not be requested');
+  });
+}
+
+/* --- 7. the browser half loads and registers its two seats --------------- */
 for (const [label, chunks] of [
   ['empty output', [{ type: 'finish', reason: { kind: 'stop' } }]],
   ['truncated output', [{ type: 'text-delta', index: 0, text: 'partial' }, { type: 'finish', reason: { kind: 'length' } }]],
@@ -588,6 +735,8 @@ const STATE_DOCUMENT = {
   model: '',
   reasoningEffort: '',
   systemPrompt: 'Rewrite the draft.',
+  referenceFiles: true,
+  referenceSkills: true,
 };
 globalThis.fetch = (url, init) => {
   fetches.push({ url, init });
@@ -729,20 +878,30 @@ const renderButton = (input, sessionId = 'session-1') => {
 /* --- 8. clicking it posts the draft, then replaces it without sending --- */
 {
   const input = makeInput('fix the login bug');
-  answers = [{ status: 200, body: { prompt: 'OPTIMIZED PROMPT', route: { provider: 'deepseek-account', model: 'deepseek-flash' } } }];
+  answers = [{
+    status: 200,
+    body: {
+      prompt: 'OPTIMIZED PROMPT\n\n@src/host.js',
+      route: { provider: 'deepseek-account', model: 'deepseek-flash' },
+      files: ['src/host.js'],
+      skills: [],
+    },
+  }];
   fetches.length = 0;
   const { tree } = renderButton(input);
   const rendered = find(tree, (node) => node.type === 'button');
   rendered.props.onClick();
   await new Promise((resolve) => setTimeout(resolve, 10));
-  check('clicking posts the exact draft to the optimize route', () => {
+  check('clicking posts the exact draft and the Session id to the optimize route', () => {
     const call = fetches.find((entry) => entry.url.endsWith('/optimize'));
     assert.notEqual(call, undefined, `the click must reach the optimize route; saw ${JSON.stringify(fetches.map((entry) => entry.url))}`);
-    assert.equal(JSON.parse(call.init.body).text, 'fix the login bug');
+    const body = JSON.parse(call.init.body);
+    assert.equal(body.text, 'fix the login bug');
+    assert.equal(body.sessionId, 'session-1', 'reference discovery needs the Session working directory');
     assert.equal(call.init.method, 'POST');
   });
   check('the optimized prompt replaces the whole draft and is never sent', () => {
-    assert.equal(input.read().draft, 'OPTIMIZED PROMPT');
+    assert.equal(input.read().draft, 'OPTIMIZED PROMPT\n\n@src/host.js');
     assert.equal(input.read().phase, 'idle', 'the composer must stay unsent');
     const submits = fetches.filter((entry) => entry.url.includes('submit'));
     assert.equal(submits.length, 0);
@@ -924,6 +1083,40 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
     const effortOptions = optionsOf(remount());
     assert.deepEqual(effortOptions.map(optionKey), ['', 'low', 'max'],
       'the effort rows must come from the catalog of the selected model');
+  });
+
+  /* The two reference switches: present, on by default, and writable. The page
+     is walked through both the component and its output, so rows are deduped. */
+  const switchesOf = (tree) => {
+    const found = [];
+    walkTree(tree, (node) => {
+      if (node.type === 'button' && node.props.role === 'switch'
+        && !found.some((seen) => seen.props['aria-label'] === node.props['aria-label'])) {
+        found.push(node);
+      }
+    });
+    return found;
+  };
+  const switches = switchesOf(remount());
+  check('the settings page offers a reference-file switch and a reference-skill switch', () => {
+    assert.deepEqual(switches.map((node) => node.props['aria-label']),
+      ['reference.files', 'reference.skills']);
+    assert.deepEqual(switches.map((node) => node.props['aria-checked']), [true, true],
+      'both reference features default to on');
+  });
+
+  switches[1].props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  check('flipping a switch persists exactly that preference', () => {
+    const write = fetches.filter((entry) => entry.url === '/prompt-forge/state' && entry.init?.method === 'POST').at(-1);
+    assert.notEqual(write, undefined, 'the flip must persist');
+    const body = JSON.parse(write.init.body);
+    assert.equal(body.referenceSkills, false, 'the flipped switch must be persisted');
+    assert.equal(body.referenceFiles, true, 'the untouched switch must keep its value');
+  });
+  check('the flipped switch reads back as off', () => {
+    const after = switchesOf(remount());
+    assert.deepEqual(after.map((node) => node.props['aria-checked']), [true, false]);
   });
 }
 
