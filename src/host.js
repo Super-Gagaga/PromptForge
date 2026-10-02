@@ -468,26 +468,34 @@ async function resolveFileReferences(hostCtx, agent, nominations, signal) {
   }
   const resolved = [];
   const seen = new Set();
-  for (const nomination of nominations.slice(0, MAX_FILE_NOMINATIONS)) {
+  /* The lookups are independent, and a cold index pays its traversal once and
+     shares it: resolving them together keeps five nominations from costing five
+     serial waits. Order is restored below, so the model's own relevance ranking
+     survives. */
+  const looked = await Promise.all(nominations.slice(0, MAX_FILE_NOMINATIONS).map(async (nomination) => {
     const query = normalizeQuery(nomination);
-    if (query === '') continue;
+    if (query === '') return undefined;
     let candidates;
     try {
       candidates = await service.list(agent, query, signal);
     } catch {
       /* One failed lookup drops its own nomination only. */
-      continue;
+      return undefined;
     }
     const stem = query.replace(/\/+$/u, '');
     const matches = candidates.filter((candidate) => nominationMatches(candidate.path, stem));
     /* An exact hit is canonical; otherwise the index's own ranking decides, so
        the first match wins rather than a guess across the whole answer. */
     const chosen = matches.find((candidate) => candidate.path === stem) ?? matches[0];
-    if (chosen === undefined) continue;
+    if (chosen === undefined) return undefined;
     const token = formatFileMention(chosen.path, chosen.kind);
-    if (token === undefined || seen.has(token)) continue;
-    seen.add(token);
-    resolved.push({ path: chosen.path, kind: chosen.kind, token });
+    if (token === undefined) return undefined;
+    return { path: chosen.path, kind: chosen.kind, token };
+  }));
+  for (const entry of looked) {
+    if (entry === undefined || seen.has(entry.token)) continue;
+    seen.add(entry.token);
+    resolved.push(entry);
   }
   return resolved;
 }
