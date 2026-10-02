@@ -543,7 +543,7 @@ check('Host half exports apply/inject/name', () => {
   });
 
   check('the model call carries the configured route, effort, and rewrite instruction', () => {
-    const call = llm.calls.at(-1);
+    const call = llm.calls[0];
     assert.equal(call.provider, 'deepseek-account');
     assert.equal(call.model, 'deepseek-flash');
     assert.equal(call.reasoningEffort, 'max');
@@ -573,7 +573,7 @@ check('Host half exports apply/inject/name', () => {
   });
   await callRoute(routes.get('/prompt-forge/optimize'), { body: { text: 'hello' } });
   check('a configured provider/model/effort is the route actually used', () => {
-    const call = llm.calls.at(-1);
+    const call = llm.calls[0];
     assert.equal(call.model, 'deepseek-flash');
     assert.equal(call.reasoningEffort, 'low');
   });
@@ -696,16 +696,83 @@ for (const [label, answer, expectations] of [
 
   const withFiles = await callRoute(routes.get('/prompt-forge/state'), { body: { referenceFiles: true } });
   await callRoute(routes.get('/prompt-forge/optimize'), { body: { text: 'hi', sessionId: 'session-1' } });
-  const instruction = llm.calls.at(-1).system;
+  const instruction = llm.calls[0].system;
   check('the envelope instruction asks only for what the toggles enabled', () => {
     assert.equal(withFiles.json.referenceFiles, true);
     assert.equal(withFiles.json.referenceSkills, false);
     assert.match(instruction, /"files"/);
     assert.doesNotMatch(instruction, /"skills"/, 'a disabled feature must not be requested');
+    assert.doesNotMatch(instruction, /Reply with the rewritten prompt only/,
+      'the JSON contract must replace the plain-text contract, not compete with it');
   });
 }
 
-/* --- 7. the browser half loads and registers its two seats --------------- */
+/* --- 7. a prose rewrite still gets its references ------------------------ */
+{
+  await freshHome();
+  /* The first call ignores the envelope; the follow-up answers the JSON question. */
+  const replies = [
+    'Fix the login flow.',
+    JSON.stringify({ files: ['src/host'], skills: [] }),
+  ];
+  const llm = makeLlm('');
+  const recorded = llm.stream.bind(llm);
+  llm.stream = function stream(options) {
+    /* Keep recording the calls while answering with the scripted replies. */
+    recorded(options);
+    return (async function* chunks() {
+      yield { type: 'text-delta', index: 0, text: replies.shift() ?? '' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    })();
+  };
+  const index = makeFileIndex();
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    fileReferences: index,
+    skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent() },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: 'fix the login flow', sessionId: 'session-1' },
+  });
+  check('a prose rewrite triggers one follow-up nomination call and keeps its references', () => {
+    assert.equal(result.status, 200, `unexpected body: ${result.body}`);
+    assert.equal(llm.calls.length, 2, 'the rewrite plus exactly one nomination call');
+    assert.match(llm.calls[1].system, /"files"/, 'the follow-up asks the narrow JSON question');
+    assert.equal(llm.calls[1].messages[0].content[0].text, 'Fix the login flow.',
+      'the follow-up receives the finished prompt, not the raw draft');
+    assert.equal(result.json.prompt, 'Fix the login flow.\n\n@src/host.js');
+    assert.deepEqual(result.json.files, ['src/host.js']);
+  });
+}
+
+/* --- 8. an envelope answer costs no second call ------------------------- */
+{
+  await freshHome();
+  const llm = makeLlm(JSON.stringify({ prompt: 'Fix it.', files: [], skills: [] }));
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    fileReferences: makeFileIndex(),
+    skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent() },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: 'fix it', sessionId: 'session-1' },
+  });
+  check('an envelope answer stands alone without a nomination call', () => {
+    assert.equal(result.status, 200);
+    assert.equal(llm.calls.length, 1, 'an obeyed envelope needs no follow-up');
+    assert.equal(result.json.prompt, 'Fix it.');
+  });
+}
+
+/* --- 9. the browser half loads and registers its two seats --------------- */
 for (const [label, chunks] of [
   ['empty output', [{ type: 'finish', reason: { kind: 'stop' } }]],
   ['truncated output', [{ type: 'text-delta', index: 0, text: 'partial' }, { type: 'finish', reason: { kind: 'length' } }]],

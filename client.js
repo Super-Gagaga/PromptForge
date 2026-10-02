@@ -82,8 +82,22 @@ function formatFileMention(path, kind) {
 }
 
 /**
- * The rewrite envelope instruction appended when the rewrite must also nominate
- * the files and skills it depends on.
+ * The output contract the default instruction states, and the marker that lets
+ * the envelope request replace it.
+ *
+ * Appending a JSON request after a contract that says "reply with the rewritten
+ * prompt only" loses: the model follows the instruction it read first. The
+ * envelope therefore substitutes this exact paragraph instead of competing with
+ * it, so one contract is in force at a time.
+ */
+const PLAIN_OUTPUT_CONTRACT = `Output contract:
+- Reply with the rewritten prompt only.
+- No preamble, no explanation, no commentary, no surrounding quotes or code fences, and no trailing notes about what you changed.
+- If the input is already an excellent prompt, reply with it unchanged rather than describing it.`;
+
+/**
+ * The JSON envelope instruction appended when the rewrite must also nominate the
+ * files and skills it depends on.
  *
  * The model never writes a reference token itself: it names paths and skill
  * names, and the Host validates every nomination against the live file index and
@@ -100,18 +114,50 @@ function buildEnvelopeInstruction(files, skills) {
   if (files) fields.push('"files": string[] — workspace-relative paths, or distinctive path fragments');
   if (skills) fields.push('"skills": string[] — kebab-case names of skills this task needs');
   const rules = [
-    'Reply with ONE JSON object and nothing else. No prose, no code fence, no trailing text.',
-    `Shape: { ${fields.join(', ')} }.`,
+    'Output contract (overrides any other output instruction):',
+    `- Reply with ONE JSON object and nothing else: { ${fields.join(', ')} }.`,
+    '- No prose around it, no code fence, no trailing text.',
   ];
   if (files) {
-    rules.push('For "files": list only files this task genuinely depends on, most relevant first, at most 5. Give the most specific path you can justify from the request; when you cannot name a real path, use a distinctive fragment of one. Never invent a file you have no reason to believe exists, and never list a file the request does not need.');
+    rules.push('- For "files": list only files this task genuinely depends on, most relevant first, at most 5. Give the most specific path you can justify from the request; when you cannot name a real path, use a distinctive fragment of one. Never invent a file you have no reason to believe exists, and never list a file the request does not need.');
   }
   if (skills) {
-    rules.push('For "skills": list only skills you are confident exist and that this task needs, at most 3. Use an empty array when none apply.');
+    rules.push('- For "skills": list only skills you are confident exist and that this task needs, at most 3. Use an empty array when none apply.');
   }
-  rules.push('Include every field even when it is empty, and prefer an empty list over a guess.');
+  rules.push('- Include every field even when it is empty, and prefer an empty list over a guess.');
   return `\n\n${rules.join('\n')}`;
 }
+
+/**
+ * Compose the system instruction for one rewrite.
+ *
+ * @param systemPrompt - the user's configured instruction.
+ * @param files - whether file nominations are collected.
+ * @param skills - whether skill nominations are collected.
+ * @returns the instruction the model receives.
+ */
+function composeSystemPrompt(systemPrompt, files, skills) {
+  const envelope = buildEnvelopeInstruction(files, skills);
+  if (envelope === '') return systemPrompt;
+  return `${systemPrompt.replace(PLAIN_OUTPUT_CONTRACT, '').trimEnd()}${envelope}`;
+}
+
+/**
+ * The follow-up instruction used when the rewrite came back without an envelope.
+ *
+ * A small model reliably answers a JSON question about one file list, and even
+ * more reliably when the question is the only thing asked. This is the second
+ * chance for a rewrite that ignored the envelope: the prompt text is already
+ * final, and only the nominations are missing.
+ */
+const NOMINATION_SYSTEM_PROMPT = `You extract file and skill references for a coding agent.
+
+You receive a task prompt. Name the files that prompt makes the agent read or change, and the skills it needs. You may name a path or a distinctive fragment of one; an index will confirm it, so a fragment is safer than a guess.
+
+Reply with ONE JSON object and nothing else:
+{ "files": string[], "skills": string[] }
+
+Use empty arrays when nothing applies. At most 5 files and 3 skills.`;
 
 /**
  * The rewrite instruction. Placeholders keep the two variable parts (the text
@@ -129,10 +175,7 @@ Rules:
 - Structure only as much as the content earns: plain prose for short asks, a short labelled list when there are several distinct requirements. Do not force a template onto a simple request.
 - Keep any leading slash command, file reference, or mention marker exactly where the author put it, and keep it on the first line.
 
-Output contract:
-- Reply with the rewritten prompt only.
-- No preamble, no explanation, no commentary, no surrounding quotes or code fences, and no trailing notes about what you changed.
-- If the input is already an excellent prompt, reply with it unchanged rather than describing it.`;
+${PLAIN_OUTPUT_CONTRACT}`;
 
 /* ------------------------------------------------------------------ settings */
 

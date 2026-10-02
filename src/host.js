@@ -207,15 +207,51 @@ function accumulateText() {
 }
 
 /**
+ * Run one model call and return its assistant text.
+ *
+ * @param llm - the live LLM service.
+ * @param route - provider, model, and optional reasoning effort.
+ * @param system - the system instruction for this call.
+ * @param userText - the user-role text for this call.
+ * @returns the streamed assistant text.
+ * @throws when the call fails, is aborted, or ends without a usable finish.
+ */
+async function callModel(llm, route, system, userText) {
+  const messages = [{
+    role: 'user',
+    content: [{ type: 'text', text: userText }],
+  }];
+  const options = {
+    provider: route.provider,
+    model: route.model,
+    messages,
+    system,
+    maxTokens: MAX_OUTPUT_TOKENS,
+    purpose: 'prompt-forge',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+  };
+  const assembler = accumulateText();
+  for await (const chunk of llm.stream(options)) assembler.push(chunk);
+  const failure = finishFailure(assembler.reason());
+  if (failure !== null) throw new Error(failure);
+  if (assembler.openedToolCall()) {
+    throw new Error('the model returned a tool call instead of prompt text');
+  }
+  return assembler.text();
+}
+
+/**
  * Read the model's rewrite answer, tolerating both envelope shapes.
  *
  * A model that was asked for the JSON envelope usually returns it, but a
  * provider may wrap it in a code fence or ignore the instruction entirely. A
  * plain-text answer is still a usable rewrite, so it degrades to one instead of
- * failing the request.
+ * failing the request — `enveloped` tells the caller that the nominations are
+ * still missing and worth a follow-up question.
  *
  * @param text - the assistant text exactly as streamed.
- * @returns the rewrite plus any nominated paths and skill names.
+ * @returns the rewrite, any nominations, and whether an envelope arrived.
  */
 function readRewriteAnswer(text) {
   const trimmed = text.trim();
@@ -232,6 +268,7 @@ function readRewriteAnswer(text) {
             prompt: parsed.prompt,
             files: Array.isArray(parsed.files) ? parsed.files.filter((item) => typeof item === 'string') : [],
             skills: Array.isArray(parsed.skills) ? parsed.skills.filter((item) => typeof item === 'string') : [],
+            enveloped: true,
           };
         }
       } catch {
@@ -239,7 +276,40 @@ function readRewriteAnswer(text) {
       }
     }
   }
-  return { prompt: trimmed, files: [], skills: [] };
+  return { prompt: trimmed, files: [], skills: [], enveloped: false };
+}
+
+/**
+ * Ask the model once more for the nominations its rewrite omitted.
+ *
+ * The prompt text is already final by now, so this call only names files and
+ * skills. It is worth the extra round trip because the alternative is a silent
+ * no-op: a model that ignored the envelope still knows which files the task
+ * touches, and the narrow question is what surfaces it.
+ *
+ * @param llm - the live LLM service.
+ * @param route - the route the rewrite used.
+ * @param prompt - the finished rewrite.
+ * @returns nominated paths and skill names, empty when the answer is unusable.
+ */
+async function nominateReferences(llm, route, prompt) {
+  const text = await callModel(llm, route, NOMINATION_SYSTEM_PROMPT, prompt);
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/u.exec(trimmed);
+  const body = fenced === null ? trimmed : fenced[1];
+  const start = body.indexOf('{');
+  const end = body.lastIndexOf('}');
+  if (start === -1 || end <= start) return { files: [], skills: [] };
+  try {
+    const parsed = JSON.parse(body.slice(start, end + 1));
+    if (parsed === null || typeof parsed !== 'object') return { files: [], skills: [] };
+    return {
+      files: Array.isArray(parsed.files) ? parsed.files.filter((item) => typeof item === 'string') : [],
+      skills: Array.isArray(parsed.skills) ? parsed.skills.filter((item) => typeof item === 'string') : [],
+    };
+  } catch {
+    return { files: [], skills: [] };
+  }
 }
 
 /** Normalize one model-nominated path into the shape the file index speaks. */
@@ -391,35 +461,13 @@ async function forgePrompt(ctx, state, text, llm, sessionId) {
   const route = resolveRoute(llm, ctx.get('agentDefaultModel'), state);
   const wantFiles = state.referenceFiles;
   const wantSkills = state.referenceSkills;
-  /* A request-only user input: no id/source is needed because this call never
-     enters a Session log. */
-  const messages = [{
-    role: 'user',
-    content: [{
-      type: 'text',
-      text: `Rewrite the following composer text.\n\n<composer_text>\n${text}\n</composer_text>`,
-    }],
-  }];
-  const options = {
-    provider: route.provider,
-    model: route.model,
-    messages,
-    system: `${state.systemPrompt}${buildEnvelopeInstruction(wantFiles, wantSkills)}`,
-    maxTokens: MAX_OUTPUT_TOKENS,
-    purpose: 'prompt-forge',
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-  };
-
-  const assembler = accumulateText();
-  for await (const chunk of llm.stream(options)) assembler.push(chunk);
-
-  const failure = finishFailure(assembler.reason());
-  if (failure !== null) throw new Error(failure);
-  if (assembler.openedToolCall()) {
-    throw new Error('the model returned a tool call instead of prompt text');
-  }
-  const answer = readRewriteAnswer(assembler.text());
+  const referencesWanted = wantFiles || wantSkills;
+  const answer = readRewriteAnswer(await callModel(
+    llm,
+    route,
+    composeSystemPrompt(state.systemPrompt, wantFiles, wantSkills),
+    `Rewrite the following composer text.\n\n<composer_text>\n${text}\n</composer_text>`,
+  ));
   if (answer.prompt === '') throw new Error(EMPTY_OUTPUT_MESSAGE);
   if (answer.prompt.length > MAX_INPUT_CHARS) {
     throw new Error('the optimized prompt came back longer than the composer limit');
@@ -437,16 +485,26 @@ async function forgePrompt(ctx, state, text, llm, sessionId) {
   const notes = [];
   let files = [];
   let skills = [];
-  if (wantFiles && answer.files.length > 0) {
+  let nominations = { files: answer.files, skills: answer.skills };
+  if (referencesWanted && !answer.enveloped) {
+    /* The model answered in prose, so its nominations never came. Ask the narrow
+       question once; a second failure here still leaves the user their rewrite. */
     try {
-      files = await resolveFileReferences(ctx, agent, answer.files, referenceSignal);
+      nominations = await nominateReferences(llm, route, answer.prompt);
+    } catch (error) {
+      notes.push(`reference nomination failed: ${String(error?.message ?? error)}`);
+    }
+  }
+  if (wantFiles && nominations.files.length > 0) {
+    try {
+      files = await resolveFileReferences(ctx, agent, nominations.files, referenceSignal);
     } catch (error) {
       notes.push(String(error?.message ?? error));
     }
   }
-  if (wantSkills && answer.skills.length > 0) {
+  if (wantSkills && nominations.skills.length > 0) {
     try {
-      skills = await resolveSkillReferences(ctx, agent, cwd, answer.skills, referenceSignal);
+      skills = await resolveSkillReferences(ctx, agent, cwd, nominations.skills, referenceSignal);
     } catch (error) {
       notes.push(String(error?.message ?? error));
     }
