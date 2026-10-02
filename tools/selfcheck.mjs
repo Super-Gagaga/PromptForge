@@ -14,6 +14,7 @@
 import { strict as assert } from 'node:assert';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createContext, runInContext } from 'node:vm';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -703,7 +704,10 @@ for (const [label, answer, expectations] of [
       .map((query) => query.query)
       .filter((query) => query !== '' && !query.endsWith('/'));
     assert.deepEqual(nominations, expectations.queried);
-    assert.equal(result.json.notes, undefined, 'a healthy pass records no note');
+    if (typeof answer === 'string' && !answer.startsWith('```json')) {
+      assert.match(result.json.notes.join(' '), /nomination response/);
+      assert.equal(result.json.referenceStatus, 'partial');
+    } else assert.equal(result.json.notes, undefined, 'a healthy pass records no note');
     if (expectations.queried.length > 0) {
       assert.equal(index.queries[0].agent, agent, 'discovery must be scoped to the live agent');
     }
@@ -885,10 +889,246 @@ for (const [label, answer, expectations] of [
   check('a nomination whose own name was deleted from the prompt is refused', () => {
     assert.equal(result.status, 200);
     assert.deepEqual(result.json.files, [], 'the reference must not be paid for with a broken sentence');
-    assert.equal(result.json.prompt, '检查与的登录逻辑是否一致',
-      'the prose is returned as the model wrote it');
-    assert.match(String(result.json.notes), /removed those names/, 'the drop is reported, not silent');
+    assert.equal(result.json.prompt, '检查 web/admin-login.html 与后端路由逻辑是否合理',
+      'a damaged rewrite must preserve the original draft');
+    assert.match(String(result.json.notes), /original draft was preserved/, 'the drop is reported, not silent');
   });
+}
+
+/* Reference regressions: drive the shipped Host routes, with scripted responses. */
+for (const scenario of [
+  {
+    label: 'a skill-only rewrite keeps its valid nomination without another model call',
+    settings: { referenceFiles: false },
+    replies: [{ prompt: 'Create a document.', skills: ['office-docx'] }],
+    files: [], skills: ['office-docx'], calls: 1,
+  },
+  {
+    label: 'file fallback preserves an already validated skill',
+    replies: [{ prompt: 'Review.', files: [], skills: ['office-docx'] }, { files: ['src/host.js'], skills: [] }],
+    files: ['src/host.js'], skills: ['office-docx'], calls: 2,
+  },
+  {
+    label: 'invalid initial file nominations get a validated fallback',
+    replies: [{ prompt: 'Review.', files: ['src/missing.js'], skills: [] }, { files: ['src/host.js'] }],
+    files: ['src/host.js'], skills: [], calls: 2,
+  },
+  {
+    label: 'an explicit empty skill-only answer does not trigger a second call',
+    settings: { referenceFiles: false },
+    replies: [{ prompt: 'Review.', skills: [] }], files: [], skills: [], calls: 1,
+  },
+  {
+    label: 'invalid skills can be supplemented without replacing valid files',
+    replies: [{ prompt: 'Review.', files: ['src/host.js'], skills: ['missing'] }, { skills: ['office-docx'] }],
+    files: ['src/host.js'], skills: ['office-docx'], calls: 2,
+  },
+  {
+    label: 'lost original paths restore the draft even without model nominations',
+    text: 'Review src/host.js.',
+    replies: [{ prompt: 'Review.', files: [], skills: [] }],
+    files: [], skills: [], calls: 1, prompt: 'Review src/host.js.',
+  },
+]) {
+  await freshHome();
+  const llm = makeLlm('');
+  const recorded = llm.stream.bind(llm);
+  const replies = [...scenario.replies];
+  llm.stream = (options) => {
+    recorded(options);
+    return (async function* () {
+      yield { type: 'text-delta', index: 0, text: JSON.stringify(replies.shift() ?? {}) };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    })();
+  };
+  const { ctx, routes } = makeHostContext({
+    llm, webServer: {}, fileReferences: makeFileIndex(), skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent('/workspace') },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  if (scenario.settings) await callRoute(routes.get('/prompt-forge/state'), { body: scenario.settings });
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: scenario.text ?? 'Review.', sessionId: 'session-1' },
+  });
+  check(scenario.label, () => {
+    assert.equal(result.status, 200, result.body);
+    assert.deepEqual(result.json.files, scenario.files);
+    assert.deepEqual(result.json.skills, scenario.skills);
+    assert.equal(llm.calls.length, scenario.calls);
+    if (scenario.prompt) assert.equal(result.json.prompt, scenario.prompt);
+    if (scenario.calls === 2) {
+      const instruction = llm.calls[1].system;
+      if (scenario.skills.length > 0 && scenario.files.length > 0 && scenario.replies[0].files.length === 0) {
+        assert.doesNotMatch(instruction, /"skills"/);
+      }
+    }
+  });
+}
+
+/* Isolate private helpers and shorten real timers for cancellation regressions. */
+{
+  const source = (await read('lib/index.js'))
+    .replace(/^import .*;\r?$/gm, '').replace(/^export .*;\r?$/gm, '');
+  const timers = [];
+  const sandbox = createContext({
+    AbortSignal: {
+      timeout: (ms) => {
+        timers.push(ms);
+        return AbortSignal.timeout(ms >= 120000 ? 1000 : ms >= 15000 ? 100 : ms >= 5000 ? 20 : 10);
+      },
+      any: (signals) => AbortSignal.any(signals),
+    },
+  });
+  runInContext(source, sandbox);
+  const envelopeResults = runInContext(`[
+    readRewriteAnswer('Explain this JSON example: {"prompt":"example value"}'),
+    readRewriteAnswer('{"prompt":"example value"}', false, false),
+    readRewriteAnswer('{"prompt":"Rewrite","files":[],"skills":[]}'),
+    readRewriteAnswer('prefix {"prompt":"Rewrite","files":[],"skills":[]} suffix'),
+    readRewriteAnswer('{"prompt":"Rewrite","files":[1],"skills":[]}'),
+    readRewriteAnswer('[{"prompt":"Rewrite","files":[],"skills":[]}]')
+  ]`, sandbox);
+  check('only a complete valid envelope under the active contract is unwrapped', () => {
+    assert.equal(envelopeResults[0].prompt, 'Explain this JSON example: {"prompt":"example value"}');
+    assert.equal(envelopeResults[1].prompt, '{"prompt":"example value"}');
+    assert.equal(envelopeResults[2].prompt, 'Rewrite');
+    for (const index of [0, 1, 3, 4, 5]) assert.equal(envelopeResults[index].enveloped, false);
+  });
+  const directories = await runInContext(`resolveFileReferences({get:()=>({list:async(agent,query)=>
+    query==='src/' ? [{path:'src/pages',kind:'directory'}] : [{path:'src/pages/login.html',kind:'file'}]
+  })}, {}, ['src/pages/'], AbortSignal.timeout(15000))`, sandbox);
+  check('directory nominations resolve the directory metadata instead of its children', () => {
+    assert.equal(directories.length, 1);
+    assert.equal(directories[0].path, 'src/pages');
+    assert.equal(directories[0].token, '@src/pages/');
+  });
+  const nonexistentDirectory = await runInContext(`resolveFileReferences({get:()=>({list:async()=>[
+    {path:'src/pages/login.html',kind:'file'}
+  ]})}, {}, ['src/pages/'], AbortSignal.timeout(15000))`, sandbox);
+  check('children alone are insufficient to confirm a directory nomination', () => {
+    assert.equal(nonexistentDirectory.length, 0);
+  });
+  const discovery = await runInContext(`listWorkspacePaths({list:async(agent,query)=>{
+    const entries=[{path:'README.md',kind:'file'}, {path:'custom',kind:'directory'},
+      {path:'src',kind:'directory'}, ...Array.from({length:200},(_,i)=>({path:'src/file'+i+'.js',kind:'file'})),
+      {path:'custom/deep',kind:'directory'}, {path:'custom/deep/more',kind:'directory'},
+      {path:'custom/deep/more/target.js',kind:'file'}];
+    return entries.filter(entry=>entry.path.startsWith(query) && !entry.path.slice(query.length).includes('/'));
+  }}, {}, AbortSignal.timeout(15000), 'Review custom/deep/more/target.js and README.md')`, sandbox);
+  check('candidate discovery includes root files, task paths and nonconventional directories within budget', () => {
+    assert.ok(discovery.includes('README.md'));
+    assert.ok(discovery.includes('custom/deep/more/target.js'));
+    assert.ok(discovery.length <= 160);
+  });
+  const fallbackDiscovery = await runInContext(`listWorkspacePaths({list:async(agent,query)=>{
+    if(query==='') throw new Error('root unsupported');
+    return query==='custom/' ? [{path:'custom/target.js',kind:'file'}] : [];
+  }}, {}, AbortSignal.timeout(15000), 'Review custom/target.js')`, sandbox);
+  check('task directory discovery still works when root listing is unsupported', () => {
+    assert.ok(fallbackDiscovery.includes('custom/target.js'));
+  });
+  const composition = runInContext(`(()=>{
+    const file={path:'src/host.js',kind:'file',token:'@src/host.js'};
+    const doc={name:'office-docx'};
+    const first=appendReferences('Review.\\n\\n@src/host.js', [file], [doc]);
+    const second=appendReferences(first.prompt,[file],[doc]);
+    const merged=appendReferences(first.prompt,[],[{name:'office-xlsx'}]);
+    const fenced=appendReferences('Example:\\n\\n\\x60\\x60\\x60text\\n'+SKILL_REFERENCE_MARKER+'\\noffice-docx\\n\\x60\\x60\\x60',[],[doc]);
+    const limited=appendReferences('x'.repeat(MAX_INPUT_CHARS-1),[file],[doc]);
+    return {first,second,merged,fenced,limited};
+  })()`, sandbox);
+  check('repeated reference appends are idempotent and counts include only new entries', () => {
+    assert.equal(composition.first.files.length, 0);
+    assert.equal(composition.first.skills.length, 1);
+    assert.equal(composition.second.prompt, composition.first.prompt);
+    assert.equal(composition.second.files.length + composition.second.skills.length, 0);
+    assert.equal(composition.merged.prompt.split('Skills this task may need').length, 2);
+    assert.ok(composition.merged.prompt.endsWith('office-docx\noffice-xlsx'));
+  });
+  check('managed skill blocks inside code fences are preserved as examples', () => {
+    assert.equal(composition.fenced.prompt.split('Skills this task may need').length, 3);
+    assert.equal(composition.fenced.skills.length, 1);
+  });
+  check('reference length overflow omits additions without truncating the prose', () => {
+    assert.equal(composition.limited.prompt, 'x'.repeat(59999));
+    assert.equal(composition.limited.files.length + composition.limited.skills.length, 0);
+    assert.equal(composition.limited.limited, true);
+  });
+  const matches = runInContext(`[
+    nominationMatches('src/ghost/x.js', 'host'),
+    nominationMatches('src/hostile.js', 'host'),
+    nominationMatches('src/host.js.bak', 'src/host.js'),
+    nominationMatches('src/host.js', 'host'),
+    nominationMatches('src/ghost/host.js', 'host'),
+    nominationMatches('src/host.js', 'src/host.js')
+  ]`, sandbox);
+  check('path fragments respect both boundaries while exact paths still match', () => {
+    assert.deepEqual(Array.from(matches), [false, false, false, true, true, true]);
+  });
+  const losses = runInContext(`[
+    lostOriginalPaths('Review src/host.js', 'Review src/host.js.', []),
+    lostOriginalPaths('Review README.md', 'Review README.md', []),
+    lostOriginalPaths('Review.', 'Review README.md', []),
+    lostOriginalPaths('Review @"src/my module.js"', 'Review @"src/my module.js".', [])
+  ]`, sandbox);
+  check('path preservation handles sentence punctuation, bare filenames and quoted mentions', () => {
+    assert.equal(losses[0].length, 0);
+    assert.equal(losses[1].length, 0);
+    assert.equal(losses[2][0], 'README.md');
+    assert.equal(losses[3].length, 0);
+  });
+  const resolved = await runInContext(`resolveFileReferences({get:()=>({list:async()=>[
+    {path:'src/host.js',kind:'file'}, {path:'lib/host.js',kind:'file'}
+  ]})}, {}, ['host', 'src/host.js'], AbortSignal.timeout(15000))`, sandbox);
+  check('ambiguous fragments are dropped and exact matches beat other candidates', () => {
+    assert.equal(resolved.length, 1);
+    assert.equal(resolved[0].path, 'src/host.js');
+  });
+  runInContext(`resolveRoute=()=>({provider:'p',model:'m'});`, sandbox);
+  // Keep the event loop alive: native AbortSignal.timeout timers are unreferenced.
+  const keepAlive = setInterval(() => {}, 1000);
+  try {
+    const result = await runInContext(`(async()=>{
+      let calls=0; let lookupSignal; let modelSignal;
+      callModel=async(llm,route,system,text,signal)=>{
+        calls++;
+        if(calls===1) return JSON.stringify({prompt:'Review.',files:[],skills:['doc']});
+        modelSignal=signal;
+        return new Promise(()=>{}); // Simulate a provider ignoring cancellation.
+      };
+      const ctx={get:key=>key==='agents'?{get:()=>({})}:
+        key==='skills'?{list:async({signal})=>{lookupSignal=signal;return [{name:'doc',invocation:{modelInvocable:true}}];}}:
+        key==='fileReferences'?{list:async()=>[]}:undefined};
+      const result=await forgePrompt(ctx,DEFAULT_STATE,'Review.',{},'s');
+      return {result,calls,nominationAborted:modelSignal.aborted,validationAborted:lookupSignal.aborted};
+    })()`, sandbox);
+    check('nomination timeout preserves prose and valid skills with validation time remaining', () => {
+      assert.equal(result.calls, 2);
+      assert.equal(result.nominationAborted, true);
+      assert.equal(result.validationAborted, false);
+      assert.equal(result.result.prompt.startsWith('Review.'), true);
+      assert.equal(result.result.skills[0], 'doc');
+      assert.match(result.result.notes.join(' '), /reference nomination failed/);
+      assert.ok(timers.includes(15000));
+      assert.ok(timers.some((ms) => ms > 0 && ms <= 12000));
+    });
+    const lookupResult = await runInContext(`(async()=>{
+      let calls=0;
+      callModel=async()=>{calls++;return JSON.stringify({prompt:'Review.',files:['src/host.js'],skills:['doc']});};
+      const ctx={get:key=>key==='agents'?{get:()=>({})}:
+        key==='skills'?{list:async()=>[{name:'doc',invocation:{modelInvocable:true}}]}:
+        key==='fileReferences'?{list:async()=>new Promise(()=>{})}:undefined};
+      const result=await forgePrompt(ctx,DEFAULT_STATE,'Review.',{},'s');
+      return {result,calls};
+    })()`, sandbox);
+    check('a stalled file index respects the total deadline without losing validated skills', () => {
+      assert.equal(lookupResult.calls, 1);
+      assert.equal(lookupResult.result.files.length, 0);
+      assert.equal(lookupResult.result.skills[0], 'doc');
+      assert.equal(lookupResult.result.prompt.startsWith('Review.'), true);
+    });
+  } finally { clearInterval(keepAlive); }
 }
 
 /* --- 8d. a nomination the draft never carried is kept ------------------- */
@@ -1122,6 +1362,28 @@ const renderButton = (input, sessionId = 'session-1') => {
     const submits = fetches.filter((entry) => entry.url.includes('submit'));
     assert.equal(submits.length, 0);
     assert.equal(clientRun.selections.length, 0, 'optimization must not change the conversation model');
+  });
+}
+
+/* Successful rewrites surface reference outcomes without being marked failed. */
+for (const status of ['complete', 'none', 'partial', 'preserved', 'disabled']) {
+  const input = makeInput('Review.');
+  answers = [{ status: 200, body: {
+    prompt: 'Review.', files: [], skills: [], referenceStatus: status,
+    ...(status === 'partial' ? { notes: ['file lookup failed'] } : {}),
+  } }];
+  const { tree, props } = renderButton(input);
+  find(tree, (node) => node.type === 'button').props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  react.rerender();
+  const updated = button.component(props);
+  react.reset();
+  const settingsTree = section.component({ t: clientRun.ctx.locale.bind('dsh-prompt-forge') });
+  check(`reference outcome ${status} is visible in the tooltip and settings`, () => {
+    assert.equal(updated.props.label, `reference.${status}`);
+    const statusMessage = find(settingsTree, (node) => node.props?.role === 'status');
+    assert.equal(statusMessage.props.children, `reference.${status}`);
+    assert.equal(find(updated, (node) => node.type === 'button').props['data-failed'], 'false');
   });
 }
 

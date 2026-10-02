@@ -36,9 +36,8 @@ const CANDIDATE_PATH_BUDGET = 160;
 /**
  * Directory names the candidate listing probes.
  *
- * The workspace root itself cannot be listed through this service, so discovery
- * starts from conventional top-level names; a name that is absent returns
- * nothing and costs one lookup.
+ * Fallback names for providers that do not expose root directory entries.
+ * Task paths and root discovery take precedence when available.
  */
 const CANDIDATE_DIRECTORY_HINTS = [
   'web', 'src', 'app', 'apps', 'internal', 'pkg', 'cmd', 'lib', 'server', 'client',

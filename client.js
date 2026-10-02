@@ -44,9 +44,8 @@ const CANDIDATE_PATH_BUDGET = 160;
 /**
  * Directory names the candidate listing probes.
  *
- * The workspace root itself cannot be listed through this service, so discovery
- * starts from conventional top-level names; a name that is absent returns
- * nothing and costs one lookup.
+ * Fallback names for providers that do not expose root directory entries.
+ * Task paths and root discovery take precedence when available.
  */
 const CANDIDATE_DIRECTORY_HINTS = [
   'web', 'src', 'app', 'apps', 'internal', 'pkg', 'cmd', 'lib', 'server', 'client',
@@ -283,6 +282,12 @@ const zh = {
   'action.appendedJoin': '、',
   'action.appendedFiles': ' {count} 个文件引用',
   'action.appendedSkills': ' {count} 个技能引用',
+  'reference.statusHeading': '最近一次引用处理',
+  'reference.complete': '引用已确认；本次新增 {files} 个文件引用、{skills} 个技能引用。',
+  'reference.none': '未发现相关引用。',
+  'reference.partial': '引用处理未全部完成；本次新增 {files} 个文件引用、{skills} 个技能引用。',
+  'reference.preserved': '改写丢失了原始路径或引用，已保留原稿。',
+  'reference.disabled': '自动引用已关闭。',
   'reference.heading': '自动引用',
   'reference.hint': '优化完成后，把这次改写真正依赖的文件与技能追加到提示词末尾。',
   'reference.files': '引用文件',
@@ -333,6 +338,12 @@ const en = {
   'action.appendedJoin': ' and',
   'action.appendedFiles': ' {count} file reference(s)',
   'action.appendedSkills': ' {count} skill reference(s)',
+  'reference.statusHeading': 'Last reference processing result',
+  'reference.complete': 'References confirmed; added {files} file and {skills} skill reference(s).',
+  'reference.none': 'No relevant references found.',
+  'reference.partial': 'Reference processing was incomplete; added {files} file and {skills} skill reference(s).',
+  'reference.preserved': 'The rewrite lost original paths or mentions; your original draft was preserved.',
+  'reference.disabled': 'Automatic references are off.',
   'reference.heading': 'Automatic references',
   'reference.hint': 'After a rewrite, append the files and skills that rewrite actually depends on.',
   'reference.files': 'Reference files',
@@ -683,6 +694,25 @@ function useLastFailure() {
   );
 }
 
+let lastReferenceResult = null;
+const referenceResultListeners = new Set();
+function setLastReferenceResult(result) {
+  lastReferenceResult = result;
+  for (const listener of [...referenceResultListeners]) listener();
+}
+function useLastReferenceResult() {
+  return ReactRuntime.useSyncExternalStore(
+    (listener) => { referenceResultListeners.add(listener); return () => referenceResultListeners.delete(listener); },
+    () => lastReferenceResult,
+    () => lastReferenceResult,
+  );
+}
+function referenceResultTip(t, result) {
+  if (!result) return undefined;
+  const known = ['complete', 'none', 'partial', 'preserved', 'disabled'];
+  return known.includes(result.status) ? t(`reference.${result.status}`, result) : undefined;
+}
+
 /* --------------------------------------------------------------- utilities */
 
 /** Find one provider group by id. */
@@ -795,10 +825,13 @@ function PromptForgeButton(props) {
       inputActions.setDraft(body.prompt);
       setLastFailure(null);
       /* Report what was appended so an added reference is never a surprise. */
-      setAppended({
+      const referenceResult = {
+        status: body.referenceStatus ?? (body.notes?.length > 0 ? 'partial' : undefined),
         files: Array.isArray(body.files) ? body.files.length : 0,
         skills: Array.isArray(body.skills) ? body.skills.length : 0,
-      });
+      };
+      setAppended(referenceResult);
+      setLastReferenceResult(referenceResult);
       setBusy(false);
     } catch (error) {
       const message = String(error?.message ?? error);
@@ -820,7 +853,7 @@ function PromptForgeButton(props) {
 
   const tip = busy
     ? t('action.busy')
-    : failed ? t('action.failed', { message: lastFailure ?? '' }) : appendedTip(t, appended) ?? t('action.title');
+    : failed ? t('action.failed', { message: lastFailure ?? '' }) : referenceResultTip(t, appended) ?? appendedTip(t, appended) ?? t('action.title');
   return ReactRuntime.createElement(Tooltip, {
     label: tip,
     side: 'top',
@@ -832,6 +865,7 @@ function PromptForgeButton(props) {
     'data-busy': busy ? 'true' : 'false',
     'data-failed': failed ? 'true' : 'false',
     'aria-label': busy ? t('action.busy') : t('action.aria'),
+    'aria-description': referenceResultTip(t, appended),
     'aria-busy': busy ? 'true' : 'false',
     disabled: busy || locked,
     onMouseDown: (event) => event.preventDefault(),
@@ -1099,6 +1133,7 @@ function PromptForgeSettings(props) {
   const catalog = useCatalog();
   const used = effectiveSelection(catalog.value, settings);
   const failure = useLastFailure();
+  const referenceResult = useLastReferenceResult();
   const [promptDraft, setPromptDraft] = ReactRuntime.useState(null);
   const [saved, setSaved] = ReactRuntime.useState(false);
   const settled = ReactRuntime.useRef(false);
@@ -1259,6 +1294,11 @@ function PromptForgeSettings(props) {
       key: item.id,
       className: 'PF-error',
     }, `${item.name ?? item.id}: ${item.message ?? ''}`))),
+
+    referenceResultTip(t, referenceResult) === undefined ? null : ReactRuntime.createElement(Section, {
+      key: 'last-reference-result',
+      title: t('reference.statusHeading'),
+    }, ReactRuntime.createElement('p', { className: 'PF-hint', role: 'status' }, referenceResultTip(t, referenceResult))),
 
     failure === null ? null : ReactRuntime.createElement(Section, {
       key: 'last-error',

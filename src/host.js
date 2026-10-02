@@ -213,10 +213,11 @@ function accumulateText() {
  * @param route - provider, model, and optional reasoning effort.
  * @param system - the system instruction for this call.
  * @param userText - the user-role text for this call.
+ * @param signal - cancellation deadline, shared with reference work for a follow-up.
  * @returns the streamed assistant text.
  * @throws when the call fails, is aborted, or ends without a usable finish.
  */
-async function callModel(llm, route, system, userText) {
+async function callModel(llm, route, system, userText, signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS)) {
   const messages = [{
     role: 'user',
     content: [{ type: 'text', text: userText }],
@@ -228,7 +229,7 @@ async function callModel(llm, route, system, userText) {
     system,
     maxTokens: MAX_OUTPUT_TOKENS,
     purpose: 'prompt-forge',
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    signal,
     ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
   };
   const assembler = accumulateText();
@@ -239,6 +240,16 @@ async function callModel(llm, route, system, userText) {
     throw new Error('the model returned a tool call instead of prompt text');
   }
   return assembler.text();
+}
+
+/** Parse a complete JSON object, optionally enclosed by a single JSON fence. */
+function parseWholeObject(text) {
+  const trimmed = text.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/u.exec(trimmed);
+  try {
+    const value = JSON.parse(fenced === null ? trimmed : fenced[1]);
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  } catch { return null; }
 }
 
 /**
@@ -253,49 +264,17 @@ async function callModel(llm, route, system, userText) {
  * @param text - the assistant text exactly as streamed.
  * @returns the rewrite, any nominations, and whether an envelope arrived.
  */
-function readRewriteAnswer(text) {
-  const trimmed = text.trim();
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/u.exec(trimmed);
-  const body = fenced === null ? trimmed : fenced[1];
-  const start = body.indexOf('{');
-  if (start !== -1) {
-    const end = body.lastIndexOf('}');
-    if (end > start) {
-      try {
-        const parsed = JSON.parse(body.slice(start, end + 1));
-        if (parsed !== null && typeof parsed === 'object' && typeof parsed.prompt === 'string') {
-          return {
-            prompt: parsed.prompt,
-            files: Array.isArray(parsed.files) ? parsed.files.filter((item) => typeof item === 'string') : [],
-            skills: Array.isArray(parsed.skills) ? parsed.skills.filter((item) => typeof item === 'string') : [],
-            enveloped: true,
-          };
-        }
-      } catch {
-        /* Not JSON after all: the whole answer is the rewrite. */
-      }
-    }
+function readRewriteAnswer(text, files = true, skills = true) {
+  const parsed = files || skills ? parseWholeObject(text) : null;
+  const validList = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string');
+  if (parsed !== null && typeof parsed.prompt === 'string'
+    && (!files || validList(parsed.files)) && (!skills || validList(parsed.skills))) {
+    return { prompt: parsed.prompt, files: files ? parsed.files : [],
+      skills: skills ? parsed.skills : [], enveloped: true };
   }
-  return { prompt: trimmed, files: [], skills: [], enveloped: false };
+  // Preserve arbitrary prose and JSON examples; never extract an embedded object.
+  return { prompt: text.trim(), files: [], skills: [], enveloped: false };
 }
-
-/**
- * One follow-up question to the model: which of these real files does the task
- * need?
- *
- * This is the second chance for a rewrite whose envelope carried no paths. The
- * model is shown the workspace's actual paths, so nominating stops being a guess
- * — and the reference validator still confirms every pick, so a path outside the
- * listing is simply dropped.
- */
-const CANDIDATE_SYSTEM_PROMPT = `You pick the files a coding task needs.
-
-You receive a task prompt and a list of paths that really exist in the workspace. Choose the entries the task requires the agent to read or change, and copy their paths exactly as listed. Never invent a path, and never pick an entry the task does not need.
-
-Reply with ONE JSON object and nothing else:
-{ "files": string[], "skills": string[] }
-
-"files" holds paths copied from the list, most relevant first, at most 5. Use an empty array only when no listed path is genuinely relevant. "skills" is usually empty.`;
 
 /**
  * Ask the model once more for the nominations its rewrite omitted.
@@ -309,30 +288,28 @@ Reply with ONE JSON object and nothing else:
  * @param route - the route the rewrite used.
  * @param prompt - the finished rewrite.
  * @param candidatePaths - real workspace paths to choose from, when available.
+ * @param files - whether missing file nominations should be requested.
+ * @param skills - whether missing skill nominations should be requested.
+ * @param signal - bounded nomination deadline within the reference stage.
  * @returns nominated paths and skill names, empty when the answer is unusable.
  */
-async function nominateReferences(llm, route, prompt, candidatePaths = []) {
+async function nominateReferences(llm, route, prompt, candidatePaths = [], files = true, skills = true, signal) {
   const userText = candidatePaths.length === 0
     ? prompt
     : `${prompt}\n\n<workspace_paths>\n${candidatePaths.join('\n')}\n</workspace_paths>`;
-  const system = candidatePaths.length === 0 ? NOMINATION_SYSTEM_PROMPT : CANDIDATE_SYSTEM_PROMPT;
-  const text = await callModel(llm, route, system, userText);
-  const trimmed = text.trim();
-  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/u.exec(trimmed);
-  const body = fenced === null ? trimmed : fenced[1];
-  const start = body.indexOf('{');
-  const end = body.lastIndexOf('}');
-  if (start === -1 || end <= start) return { files: [], skills: [] };
-  try {
-    const parsed = JSON.parse(body.slice(start, end + 1));
-    if (parsed === null || typeof parsed !== 'object') return { files: [], skills: [] };
-    return {
-      files: Array.isArray(parsed.files) ? parsed.files.filter((item) => typeof item === 'string') : [],
-      skills: Array.isArray(parsed.skills) ? parsed.skills.filter((item) => typeof item === 'string') : [],
-    };
-  } catch {
-    return { files: [], skills: [] };
+  const fields = [files ? '"files": string[]' : '', skills ? '"skills": string[]' : ''].filter(Boolean);
+  const system = `You extract references required by a coding task.
+Reply with ONE JSON object and nothing else: { ${fields.join(', ')} }.
+${files ? 'Nominate at most 5 relevant workspace-relative file paths or distinctive fragments. When workspace_paths is provided, copy only relevant paths from that list.' : 'Do not nominate files.'}
+${skills ? 'Nominate at most 3 skill names you are confident exist and this task needs.' : 'Do not nominate skills.'}
+Use empty arrays when nothing applies. Do not invent references.`;
+  const text = await withSignal(() => callModel(llm, route, system, userText, signal), signal);
+  const parsed = parseWholeObject(text);
+  const valid = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string');
+  if (parsed === null || (files && !valid(parsed.files)) || (skills && !valid(parsed.skills))) {
+    throw new Error('the reference nomination response was not a valid JSON object');
   }
+  return { files: files ? parsed.files : [], skills: skills ? parsed.skills : [] };
 }
 
 /**
@@ -341,47 +318,73 @@ async function nominateReferences(llm, route, prompt, candidatePaths = []) {
  * The reference index answers a bare query with one directory's entries, so the
  * overview is a breadth-first walk of its first levels: directories expand until
  * the budget runs out, which keeps a large tree from flooding the question while
- * still revealing every top-level area.
+ * prioritizing explicit task paths and sharing capacity across top-level areas.
  *
  * @param service - the file-reference service.
  * @param agent - live agent whose working directory bounds discovery.
  * @param signal - cancellation for the listings.
  * @returns workspace-relative paths, breadth-first, capped by the budget.
  */
-async function listWorkspacePaths(service, agent, signal) {
+async function listWorkspacePaths(service, agent, signal, prompt = '', notes = []) {
   const paths = [];
   const seen = new Set();
+  const visited = new Set();
   const budget = CANDIDATE_PATH_BUDGET;
-  const collect = (entries) => {
-    const children = [];
-    for (const entry of entries) {
-      if (paths.length >= budget) break;
-      if (seen.has(entry.path)) continue;
-      seen.add(entry.path);
-      paths.push(entry.path);
-      if (entry.kind === 'directory') children.push(`${entry.path}/`);
-    }
-    return children;
-  };
-  const list = async (directory) => {
+  const terms = prompt.toLowerCase().match(/[\p{L}\p{N}_.-]{3,}/gu) ?? [];
+  const score = (path) => terms.reduce((sum, term) => sum + (path.toLowerCase().includes(term) ? term.length : 0), 0);
+  let successfulQueries = 0;
+  const list = async (query) => {
     try {
-      return await service.list(agent, directory, signal);
-    } catch {
-      return [];
-    }
+      const entries = await withSignal(() => service.list(agent, query, signal), signal);
+      successfulQueries++;
+      return [...entries];
+    } catch { return []; }
   };
-  const queue = [];
-  for (const name of CANDIDATE_DIRECTORY_HINTS) {
-    if (paths.length >= budget) break;
-    const entries = await list(`${name}/`);
-    if (entries.length > 0) queue.push(...collect(entries));
+  const collect = (entry) => {
+    if (seen.has(entry.path) || paths.length >= budget) return;
+    seen.add(entry.path);
+    paths.push(entry.kind === 'directory' ? `${entry.path.replace(/\/+$/u, '')}/` : entry.path);
+  };
+  // Task paths get first use of the budget, including nonconventional directories.
+  const explicit = lostOriginalPaths('', prompt, []);
+  for (const path of explicit.slice(0, 8)) {
+    if (signal.aborted) break;
+    const entries = await list(path.replace(/\/+$/u, ''));
+    for (const entry of entries.filter((entry) => nominationMatches(entry.path, path.replace(/\/+$/u, '')))) collect(entry);
   }
-  /* One level deeper, so a monorepo layout still surfaces real files. */
-  while (queue.length > 0 && paths.length < budget) {
-    const directory = queue.shift();
-    if (directory.split('/').filter(Boolean).length > 2) continue;
-    collect(await list(directory));
+  // Root listing is optional: older providers may reject it or return nothing.
+  const rootEntries = signal.aborted ? [] : await list('');
+  const roots = rootEntries.filter((entry) => entry.kind === 'directory').map((entry) => `${entry.path}/`);
+  const taskRoots = explicit.filter((path) => path.includes('/')).map((path) => `${path.split('/')[0]}/`);
+  let queue = [...new Set([...taskRoots, ...(roots.length > 0 ? roots : CANDIDATE_DIRECTORY_HINTS.map((name) => `${name}/`))])];
+  let batches = [rootEntries];
+  let calls = 0;
+  // Round-robin collections prevent the first large directory consuming the budget.
+  while (!signal.aborted && paths.length < budget) {
+    if (queue.length > 0 && calls < 80) {
+      const current = queue.splice(0, 6).filter((directory) => !visited.has(directory));
+      current.forEach((directory) => visited.add(directory));
+      calls += current.length;
+      batches.push(...await Promise.all(current.map(list)));
+    }
+    batches = batches.map((entries) => entries.sort((a, b) => score(b.path) - score(a.path)));
+    // Keep some capacity for later top-level areas and deeper files.
+    for (let round = 0; round < 8 && paths.length < budget; round++) {
+      for (const entries of batches) {
+        const entry = entries.shift();
+        if (!entry) continue;
+        collect(entry);
+        if (entry.kind === 'directory' && entry.path.split('/').filter(Boolean).length < 4) {
+          const directory = `${entry.path.replace(/\/+$/u, '')}/`;
+          if (!visited.has(directory) && !queue.includes(directory)) queue.push(directory);
+        }
+      }
+    }
+    batches = batches.filter((entries) => entries.length > 0);
+    if ((queue.length === 0 || calls >= 80) && batches.length === 0) break;
   }
+  if (signal.aborted) notes.push('workspace discovery timed out; only a partial candidate list was available');
+  else if (successfulQueries === 0) notes.push('workspace discovery unavailable: all index queries failed');
   return paths;
 }
 
@@ -390,9 +393,9 @@ function normalizeQuery(value) {
   return value
     .trim()
     .replaceAll('\\', '/')
-    .replace(/^\.\/+/u, '')
     .replace(/^@/u, '')
-    .replace(/^"+|"+$/gu, '');
+    .replace(/^"+|"+$/gu, '')
+    .replace(/^\.\/+/u, '');
 }
 
 /**
@@ -410,41 +413,56 @@ function normalizeQuery(value) {
  */
 function nominationMatches(path, query) {
   if (query === '') return false;
-  return path.startsWith(query)
-    || path.includes(`/${query}`)
-    || path.includes(`${query}/`);
+  if (path === query) return true;
+  // A filename with an extension is a complete name, never a prefix of a backup.
+  const completeName = /\.[^/]+$/u.test(query);
+  if (completeName && query.includes('/')) return false;
+  let offset = path.indexOf(query);
+  while (offset !== -1) {
+    const next = path[offset + query.length];
+    if ((offset === 0 || path[offset - 1] === '/')
+      && (next === undefined || next === '/' || (!completeName && next === '.'))) return true;
+    offset = path.indexOf(query, offset + 1);
+  }
+  return false;
 }
 
-/**
- * Guard the rewrite against a nomination that hollowed out the prompt.
- *
- * A model asked to list the files a task needs sometimes *replaces* those
- * phrases in the prompt with nothing, leaving a sentence like "check the login
- * logic of and" — the reference moved to the tail and the subject deleted. The
- * prose is the deliverable and the reference is a convenience, so any nomination
- * whose own name vanished from a prompt that used to carry it is refused; the
- * user keeps their sentence and simply gets fewer references.
- *
- * @param rewrite - the model's `prompt` field.
- * @param original - the draft the user typed.
- * @param nominations - the model's nominated paths.
- * @returns the nominations that did not cost the prompt any existing text.
- */
-function keepSafeNominations(rewrite, original, nominations) {
-  const lowerRewrite = rewrite.toLowerCase();
-  const lowerOriginal = original.toLowerCase();
-  return nominations.filter((nomination) => {
-    const query = normalizeQuery(nomination).toLowerCase();
-    if (query === '') return false;
-    /* Only a name the draft actually carried can be "lost". A name the model
-       contributes on its own had nothing to delete. */
-    if (!lowerOriginal.includes(query)) return true;
-    if (lowerRewrite.includes(query)) return true;
-    /* The stem may legitimately change extension or gain a suffix. */
-    const stem = (query.split('/').pop() ?? query).replace(/\.[^.]+$/u, '');
-    if (stem !== '' && lowerRewrite.includes(stem)) return true;
-    return false;
+/** Bound even providers that ignore cancellation, without leaving abort listeners. */
+async function withSignal(operation, signal) {
+  signal.throwIfAborted();
+  let onAbort;
+  const aborted = new Promise((resolve, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
   });
+  try {
+    return await Promise.race([Promise.resolve().then(operation), aborted]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+/** Restore the original draft if a concrete path or an explicit mention vanished. */
+function lostOriginalPaths(rewrite, original, nominations) {
+  const paths = new Set();
+  for (const match of original.matchAll(/@(?:"([^"\r\n]+)"|([^\s,;，；]+))/gu)) {
+    paths.add(normalizeQuery(match[1] ?? match[2]).replace(/[.,:!?，。：！？)）\]}`]+$/u, ''));
+  }
+  for (const match of original.matchAll(/(?:[\w.-]+[\\/])+[\w.-]+/gu)) {
+    if (!original.slice(Math.max(0, match.index - 3), match.index).includes('://')) {
+      paths.add(normalizeQuery(match[0]).replace(/\.+$/u, ''));
+    }
+  }
+  for (const match of original.matchAll(/[\w.-]+\.(?:[cm]?[jt]sx?|json|ya?ml|md|html?|css|scss|py|go|rs|java|sh|sql|toml|xml|vue|svelte)\b/gu)) {
+    paths.add(match[0]);
+  }
+  const normalizedOriginal = original.replaceAll('\\', '/');
+  for (const nomination of nominations) {
+    const query = normalizeQuery(nomination);
+    if (query && normalizedOriginal.includes(query)) paths.add(query);
+  }
+  const normalizedRewrite = rewrite.replaceAll('\\', '/');
+  return [...paths].filter((path) => path && !normalizedRewrite.includes(path));
 }
 
 /**
@@ -461,7 +479,7 @@ function keepSafeNominations(rewrite, original, nominations) {
  * @param signal - cancellation for the lookups.
  * @returns validated `{ path, kind, token }` entries, most relevant first.
  */
-async function resolveFileReferences(hostCtx, agent, nominations, signal) {
+async function resolveFileReferences(hostCtx, agent, nominations, signal, notes = []) {
   const service = hostCtx.get('fileReferences');
   if (service === undefined || agent === undefined) {
     throw new Error('file references are unavailable: this composition has no file-reference index for the session');
@@ -477,17 +495,31 @@ async function resolveFileReferences(hostCtx, agent, nominations, signal) {
     if (query === '') return undefined;
     let candidates;
     try {
-      candidates = await service.list(agent, query, signal);
-    } catch {
-      /* One failed lookup drops its own nomination only. */
+      const directory = query.endsWith('/');
+      const stem = query.replace(/\/+$/u, '');
+      const parent = stem.includes('/') ? `${stem.slice(0, stem.lastIndexOf('/'))}/` : '';
+      candidates = await withSignal(() => service.list(agent, directory ? parent : query, signal), signal);
+      if (directory) {
+        candidates = candidates.filter((entry) => entry.kind === 'directory' && entry.path === stem);
+        if (candidates.length === 0) {
+          const exact = await withSignal(() => service.list(agent, stem, signal), signal);
+          candidates = exact.filter((entry) => entry.kind === 'directory' && entry.path === stem);
+        }
+      }
+    } catch (error) {
+      notes.push(`file lookup failed: ${String(error?.message ?? error)}`);
       return undefined;
     }
     const stem = query.replace(/\/+$/u, '');
     const matches = candidates.filter((candidate) => nominationMatches(candidate.path, stem));
-    /* An exact hit is canonical; otherwise the index's own ranking decides, so
-       the first match wins rather than a guess across the whole answer. */
-    const chosen = matches.find((candidate) => candidate.path === stem) ?? matches[0];
-    if (chosen === undefined) return undefined;
+    /* Exact paths win; ambiguous fragments are refused instead of guessing. */
+    const exact = matches.find((candidate) => candidate.path === stem);
+    const unique = [...new Map(matches.map((candidate) => [candidate.path, candidate])).values()];
+    const chosen = exact ?? (unique.length === 1 ? unique[0] : undefined);
+    if (chosen === undefined) {
+      if (unique.length > 1) notes.push(`ambiguous file nomination: ${query}`);
+      return undefined;
+    }
     const token = formatFileMention(chosen.path, chosen.kind);
     if (token === undefined) return undefined;
     return { path: chosen.path, kind: chosen.kind, token };
@@ -523,11 +555,46 @@ async function resolveSkillReferences(hostCtx, agent, cwd, nominations, signal) 
   if (service === undefined) {
     throw new Error('skill references are unavailable: this composition has no skill catalog');
   }
-  const catalog = await service.list({ scope: agent, ...(cwd === undefined ? {} : { cwd }), signal });
+  const catalog = await withSignal(() => service.list({ scope: agent, ...(cwd === undefined ? {} : { cwd }), signal }), signal);
   const wanted = new Set(nominations.slice(0, MAX_SKILL_NOMINATIONS).map((name) => name.trim()));
   return catalog
     .filter((skill) => wanted.has(skill.name) && skill.invocation?.modelInvocable === true)
     .map((skill) => ({ name: skill.name, description: skill.description }));
+}
+
+/** Transform only prose regions, keeping fenced examples intact. */
+function outsideFences(prompt, transform) {
+  let fence = null;
+  let buffer = '';
+  let result = '';
+  for (const line of prompt.match(/[^\n]*\n|[^\n]+$/gu) ?? []) {
+    const delimiter = /^\s*(`{3,}|~{3,})/u.exec(line)?.[1];
+    if (delimiter && fence === null) {
+      result += transform(buffer);
+      buffer = '';
+      fence = delimiter;
+      result += line;
+    } else if (fence !== null) {
+      result += line;
+      if (delimiter && delimiter[0] === fence[0] && delimiter.length >= fence.length) fence = null;
+    } else { buffer += line; }
+  }
+  return result + transform(buffer);
+}
+
+/** Read mention paths outside fenced code; quoted directory mentions end at EOL. */
+function existingFileMentions(prompt) {
+  const paths = new Set();
+  outsideFences(prompt, (prose) => {
+    for (const line of prose.split('\n')) {
+      for (const match of line.matchAll(/(?:^|\s)@(?:"([^"\r\n]+)"|"([^"\r\n]+)$|([^\s`]+))/gu)) {
+        if (line.slice(0, match.index).split('`').length % 2 === 0) continue;
+        paths.add(normalizeQuery(match[1] ?? match[2] ?? match[3]).replace(/[，；,;]+$/u, ''));
+      }
+    }
+    return prose;
+  });
+  return paths;
 }
 
 /**
@@ -541,17 +608,43 @@ async function resolveSkillReferences(hostCtx, agent, cwd, nominations, signal) 
  * @param prompt - the rewritten prompt.
  * @param files - validated file references.
  * @param skills - validated skill references.
- * @returns the prompt with its reference block, or unchanged when there is none.
+ * @returns the bounded prompt and only newly appended file and skill entries.
  */
 function appendReferences(prompt, files, skills) {
-  const blocks = [prompt];
-  if (files.length > 0) {
-    blocks.push(files.map((file) => file.token).join('\n'));
+  const mentions = existingFileMentions(prompt);
+  const escapedMarker = SKILL_REFERENCE_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const blockPattern = new RegExp(`^${escapedMarker}\\r?\\n(?:[\\p{L}\\p{N}_.:/-]+\\r?(?:\\n|$))+`, 'gmu');
+  const knownSkills = new Set();
+  // Consolidate only our own well-formed blocks, preserving other prose.
+  const base = outsideFences(prompt, (prose) => prose.replace(blockPattern, (block) => {
+    block.split(/\r?\n/u).slice(1).filter(Boolean).forEach((name) => knownSkills.add(name));
+    return '';
+  })).trimEnd();
+  const acceptedFiles = [];
+  const acceptedSkills = [];
+  const tokens = [];
+  const render = () => [base, tokens.join('\n'), knownSkills.size > 0
+    ? `${SKILL_REFERENCE_MARKER}\n${[...knownSkills].join('\n')}` : ''].filter(Boolean).join('\n\n');
+  for (const file of files) {
+    const target = normalizeQuery(file.token);
+    if (mentions.has(target)) continue;
+    tokens.push(file.token);
+    if (render().length > MAX_INPUT_CHARS) { tokens.pop(); continue; }
+    mentions.add(target);
+    acceptedFiles.push(file);
   }
-  if (skills.length > 0) {
-    blocks.push(`${SKILL_REFERENCE_MARKER}\n${skills.map((skill) => skill.name).join('\n')}`);
+  for (const skill of skills) {
+    if (knownSkills.has(skill.name)) continue;
+    knownSkills.add(skill.name);
+    if (render().length > MAX_INPUT_CHARS) { knownSkills.delete(skill.name); continue; }
+    acceptedSkills.push(skill);
   }
-  return blocks.join('\n\n');
+  const result = render();
+  // Existing blocks can have significant spacing; never exceed the final limit.
+  if (result.length > MAX_INPUT_CHARS) return { prompt, files: [], skills: [], limited: true };
+  return { prompt: result, files: acceptedFiles, skills: acceptedSkills,
+    limited: files.some((file) => !mentions.has(normalizeQuery(file.token)))
+      || skills.some((skill) => !knownSkills.has(skill.name)) };
 }
 
 /**
@@ -574,81 +667,92 @@ async function forgePrompt(ctx, state, text, llm, sessionId) {
   const route = resolveRoute(llm, ctx.get('agentDefaultModel'), state);
   const wantFiles = state.referenceFiles;
   const wantSkills = state.referenceSkills;
-  const referencesWanted = wantFiles || wantSkills;
   const answer = readRewriteAnswer(await callModel(
     llm,
     route,
     composeSystemPrompt(state.systemPrompt, wantFiles, wantSkills),
     `Rewrite the following composer text.\n\n<composer_text>\n${text}\n</composer_text>`,
-  ));
+  ), wantFiles, wantSkills);
   if (answer.prompt === '') throw new Error(EMPTY_OUTPUT_MESSAGE);
   if (answer.prompt.length > MAX_INPUT_CHARS) {
     throw new Error('the optimized prompt came back longer than the composer limit');
   }
 
-  /* Reference resolution is best-effort: a composition without the index, a
-     session with no live agent, or a failing lookup must never cost the user the
-     rewrite they asked for.
-     It gets its own deadline rather than the model call's signal: that one is
-     already consumed by the finished stream, and a post-request lookup must not
-     inherit the model's remaining budget. */
+  const lost = lostOriginalPaths(answer.prompt, text, answer.files);
+  if (lost.length > 0) {
+    return { prompt: text, route, files: [], skills: [],
+      referenceStatus: 'preserved',
+      notes: ['the rewrite removed original paths or mentions; the original draft was preserved'] };
+  }
+
   const agent = ctx.get('agents')?.get(sessionId);
   const cwd = agent?.ctx?.get('session')?.cwd;
+  const referenceDeadline = Date.now() + REFERENCE_TIMEOUT_MS;
   const referenceSignal = AbortSignal.timeout(REFERENCE_TIMEOUT_MS);
   const notes = [];
   let files = [];
   let skills = [];
-  let nominations = { files: answer.files, skills: answer.skills };
-  /* Two reasons to ask the narrow question again: the model ignored the envelope
-     and never nominated anything, or it obeyed the envelope but had no idea
-     which files a conceptual task touches. The second case is the common one for
-     a prompt like "check the login page", so the question is accompanied by the
-     workspace's real paths — naming stops being a guess, and the index still
-     confirms every pick. */
-  const needNomination = referencesWanted && (!answer.enveloped || nominations.files.length === 0);
-  if (needNomination) {
-    let candidates = [];
-    if (wantFiles) {
-      try {
-        const service = ctx.get('fileReferences');
-        if (service !== undefined && agent !== undefined) {
-          candidates = await listWorkspacePaths(service, agent, referenceSignal);
+  const resolve = async (nominations, resolveFiles, resolveSkills) => {
+    await Promise.all([
+      (async () => {
+        if (!resolveFiles || nominations.files.length === 0) return;
+        try {
+          files = await resolveFileReferences(ctx, agent, nominations.files, referenceSignal, notes);
+        } catch (error) {
+          notes.push(String(error?.message ?? error));
         }
-      } catch (error) {
-        notes.push(`workspace listing failed: ${String(error?.message ?? error)}`);
+      })(),
+      (async () => {
+        if (!resolveSkills || nominations.skills.length === 0) return;
+        try {
+          skills = await resolveSkillReferences(ctx, agent, cwd, nominations.skills, referenceSignal);
+        } catch (error) {
+          notes.push(String(error?.message ?? error));
+        }
+      })(),
+    ]);
+  };
+  await resolve(answer, wantFiles, wantSkills);
+  const needFiles = wantFiles && files.length === 0;
+  // An explicit empty skill list is a valid answer; retry missing or invalid skills.
+  const needSkills = wantSkills && skills.length === 0
+    && (!answer.enveloped || answer.skills.length > 0);
+  if ((wantFiles || wantSkills) && agent === undefined) notes.push('reference processing unavailable: no live agent');
+  if (needFiles && ctx.get('fileReferences') === undefined) notes.push('file reference index unavailable');
+  if (needSkills && ctx.get('skills') === undefined) notes.push('skill catalog unavailable');
+  if ((needFiles || needSkills) && agent !== undefined && !referenceSignal.aborted) {
+    let candidates = [];
+    if (needFiles) {
+      const service = ctx.get('fileReferences');
+      if (service !== undefined) {
+        const discoverySignal = AbortSignal.any([referenceSignal, AbortSignal.timeout(5000)]);
+        candidates = await listWorkspacePaths(service, agent, discoverySignal, text, notes);
       }
     }
-    try {
-      nominations = await nominateReferences(llm, route, answer.prompt, candidates);
-    } catch (error) {
-      notes.push(`reference nomination failed: ${String(error?.message ?? error)}`);
+    // Reserve time for validation inside the single reference-stage deadline.
+    const nominationBudget = referenceDeadline - Date.now() - 3000;
+    if (nominationBudget > 0) {
+      const nominationSignal = AbortSignal.any([referenceSignal, AbortSignal.timeout(nominationBudget)]);
+      try {
+        const nominations = await nominateReferences(llm, route, answer.prompt, candidates,
+          needFiles, needSkills, nominationSignal);
+        await resolve(nominations, needFiles, needSkills);
+      } catch (error) {
+        notes.push(`reference nomination failed: ${String(error?.message ?? error)}`);
+      }
+    } else {
+      notes.push('reference nomination skipped: insufficient time remains for validation');
     }
   }
-  if (wantFiles && nominations.files.length > 0) {
-    /* Refuse any nomination whose own name disappeared from the prompt: the
-       reference must never be paid for with a broken sentence. */
-    const safe = keepSafeNominations(answer.prompt, text, nominations.files);
-    if (safe.length < nominations.files.length) {
-      notes.push('some file nominations were dropped because the rewrite had removed those names from the prompt');
-    }
-    try {
-      files = await resolveFileReferences(ctx, agent, safe, referenceSignal);
-    } catch (error) {
-      notes.push(String(error?.message ?? error));
-    }
-  }
-  if (wantSkills && nominations.skills.length > 0) {
-    try {
-      skills = await resolveSkillReferences(ctx, agent, cwd, nominations.skills, referenceSignal);
-    } catch (error) {
-      notes.push(String(error?.message ?? error));
-    }
-  }
+  const appended = appendReferences(answer.prompt, files, skills);
+  if (appended.limited) notes.push('some references were omitted to stay within the composer length limit');
   return {
-    prompt: appendReferences(answer.prompt, files, skills),
+    prompt: appended.prompt,
     route,
-    files: files.map((file) => file.path),
-    skills: skills.map((skill) => skill.name),
+    files: appended.files.map((file) => file.path),
+    skills: appended.skills.map((skill) => skill.name),
+    referenceStatus: !wantFiles && !wantSkills ? 'disabled' : notes.length > 0 ? 'partial'
+      : files.length + skills.length > 0 ? 'complete' : 'none',
     ...(notes.length === 0 ? {} : { notes }),
   };
 }
