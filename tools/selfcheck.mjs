@@ -653,7 +653,7 @@ for (const [label, answer, expectations] of [
       skills: ['office-docx', 'human-only', 'invented-skill'],
     },
     {
-      prompt: 'Fix the login flow.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/host.js\n@"src/my module.js"\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx',
+      prompt: 'Fix the login flow.\n\nFiles this task needs:\n@src/host.js\n@"src/my module.js"\n\nSkills this task may need:\n/office-docx',
       files: ['src/host.js', 'src/my module.js'],
       skills: ['office-docx'],
       queried: ['src/host', 'my module', 'src/does-not-exist'],
@@ -672,7 +672,7 @@ for (const [label, answer, expectations] of [
   [
     'accepts a fenced JSON answer',
     '```json\n{"prompt":"Fix the login flow.","files":["src/host"],"skills":[]}\n```',
-    { prompt: 'Fix the login flow.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/host.js', files: ['src/host.js'], skills: [], queried: ['src/host'] },
+    { prompt: 'Fix the login flow.\n\nFiles this task needs:\n@src/host.js', files: ['src/host.js'], skills: [], queried: ['src/host'] },
   ],
 ]) {
   await freshHome();
@@ -839,7 +839,7 @@ for (const [label, answer, expectations] of [
     assert.match(llm.calls[1].system, /"files"/, 'the follow-up asks the narrow JSON question');
     assert.match(llm.calls[1].messages[0].content[0].text, /^Fix the login flow\./,
       'the follow-up receives the finished prompt, not the raw draft');
-    assert.equal(result.json.prompt, 'Fix the login flow.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/host.js');
+    assert.equal(result.json.prompt, 'Fix the login flow.\n\nFiles this task needs:\n@src/host.js');
     assert.deepEqual(result.json.files, ['src/host.js']);
   });
 }
@@ -878,7 +878,7 @@ for (const [label, answer, expectations] of [
     assert.equal(llm.calls.length, 2, 'the empty skill list is worth one more question');
     assert.match(llm.calls[1].messages[0].content[0].text, /<available_skills>/,
       'the skill question must offer the real catalog');
-    assert.equal(result.json.prompt, 'Fix it.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/host.js\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx');
+    assert.equal(result.json.prompt, 'Fix it.\n\nFiles this task needs:\n@src/host.js\n\nSkills this task may need:\n/office-docx');
     assert.deepEqual(result.json.files, ['src/host.js']);
     assert.deepEqual(result.json.skills, ['office-docx']);
   });
@@ -920,7 +920,7 @@ for (const [label, answer, expectations] of [
     const question = llm.calls[1].messages[0].content[0].text;
     assert.match(question, /<workspace_paths>/, `the question must show real paths (notes=${JSON.stringify(result.json.notes)})`);
     assert.match(question, /web\/admin-login\.html/, 'the listing must reach the login page');
-    assert.equal(result.json.prompt, 'Review the login page.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/pages/login.html');
+    assert.equal(result.json.prompt, 'Review the login page.\n\nFiles this task needs:\n@src/pages/login.html');
     assert.deepEqual(result.json.files, ['src/pages/login.html']);
   });
 }
@@ -1125,8 +1125,7 @@ for (const scenario of [
     const added = composition.refiled;
     assert.equal(added.files.length, 1);
     assert.equal(added.prompt.split(heading).length, 2, added.prompt);
-    assert.ok(added.prompt.includes(`${heading} (trailing / means list the directory; read a file before using it):\n@src/other.js`),
-      added.prompt);
+    assert.ok(added.prompt.includes(`${heading}:\n@src/other.js`), added.prompt);
   });
   check('managed skill and file groups inside code fences are preserved as examples', () => {
     assert.equal(composition.fenced.prompt.split('Skills this task may need').length, 3);
@@ -1241,7 +1240,7 @@ for (const scenario of [
   check('a nomination the draft never carried is still appended', () => {
     assert.equal(result.status, 200);
     assert.deepEqual(result.json.files, ['web/admin-login.html']);
-    assert.equal(result.json.prompt, '检查登录流程。\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@web/admin-login.html');
+    assert.equal(result.json.prompt, '检查登录流程。\n\nFiles this task needs:\n@web/admin-login.html');
   });
 }
 
@@ -1289,7 +1288,7 @@ for (const scenario of [
     /* The appended row is the gesture DSH scans for in a user message; a bare
        name would leave the agent to find the skill on its own. */
     assert.equal(result.json.prompt,
-      '使用可用的相关技能，为我撰写一份简历。\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx');
+      '使用可用的相关技能，为我撰写一份简历。\n\nSkills this task may need:\n/office-docx');
     assert.match(result.json.prompt, /^\/office-docx$/mu, 'the row must be its own line, slash-prefixed');
     assert.equal(result.json.referenceStatus, 'complete');
   });
