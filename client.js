@@ -38,6 +38,24 @@ const REQUEST_TIMEOUT_MS = 120000;
 /** The post-request reference lookups get their own, much shorter deadline. */
 const REFERENCE_TIMEOUT_MS = 15000;
 
+/** Most workspace paths shown to the candidate question. */
+const CANDIDATE_PATH_BUDGET = 160;
+
+/**
+ * Directory names the candidate listing probes.
+ *
+ * The workspace root itself cannot be listed through this service, so discovery
+ * starts from conventional top-level names; a name that is absent returns
+ * nothing and costs one lookup.
+ */
+const CANDIDATE_DIRECTORY_HINTS = [
+  'web', 'src', 'app', 'apps', 'internal', 'pkg', 'cmd', 'lib', 'server', 'client',
+  'api', 'packages', 'public', 'static', 'assets', 'components', 'pages', 'routes',
+  'handlers', 'handler', 'controllers', 'models', 'services', 'views', 'templates',
+  'docs', 'test', 'tests', 'scripts', 'config', 'configs', 'migrations', 'sql',
+  'deploy', 'ui', 'dashboard', 'frontend', 'backend',
+];
+
 /** Upper bound on file paths the model may nominate for one rewrite. */
 const MAX_FILE_NOMINATIONS = 5;
 
@@ -120,6 +138,7 @@ function buildEnvelopeInstruction(files, skills) {
   ];
   if (files) {
     rules.push('- For "files": list only files this task genuinely depends on, most relevant first, at most 5. Give the most specific path you can justify from the request; when you cannot name a real path, use a distinctive fragment of one. Never invent a file you have no reason to believe exists, and never list a file the request does not need.');
+    rules.push('- "files" is a separate index of what the agent should open. It is NEVER a substitute for the prompt text: keep every subject, noun, and path the author wrote exactly where it belongs in "prompt". Deleting a phrase from "prompt" because it also appears in "files" produces a broken sentence and is not allowed.');
   }
   if (skills) {
     rules.push('- For "skills": list only skills you are confident exist and that this task needs, at most 3. Use an empty array when none apply.');

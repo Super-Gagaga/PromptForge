@@ -12,7 +12,7 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -445,11 +445,14 @@ const INDEX_PATHS = [
   { path: 'src/host.js', kind: 'file' },
   { path: 'src/my module.js', kind: 'file' },
   { path: 'src/pages', kind: 'directory' },
+  { path: 'src/pages/login.html', kind: 'file' },
+  { path: 'web/admin-login.html', kind: 'file' },
 ];
 
 /**
- * A fake file-reference index: it answers a query with every known path that
- * contains it, exactly as the fuzzy workspace search ranks candidates.
+ * A fake file-reference index with the real service's two query shapes: a bare
+ * or directory query lists that directory's direct entries, and anything else is
+ * a fuzzy match over known paths.
  */
 function makeFileIndex() {
   const queries = [];
@@ -458,7 +461,15 @@ function makeFileIndex() {
     list: async (agent, query) => {
       queries.push({ agent, query });
       if (agent === undefined) throw new Error('no agent');
-      return INDEX_PATHS.filter((candidate) => candidate.path.includes(query));
+      const normalized = query.replaceAll('\\', '/');
+      if (normalized === '' || normalized.endsWith('/')) {
+        const prefix = normalized === '' ? '' : normalized;
+        return INDEX_PATHS.filter((candidate) => {
+          if (!candidate.path.startsWith(prefix)) return false;
+          return !candidate.path.slice(prefix.length).includes('/');
+        });
+      }
+      return INDEX_PATHS.filter((candidate) => candidate.path.includes(normalized));
     },
   };
 }
@@ -481,10 +492,36 @@ function makeSkillCatalog() {
   };
 }
 
-/** One live agent stand-in, with the session its skill lookup reads. */
-function makeAgent() {
-  const session = { cwd: 'C:/work' };
-  return { id: 'session-1', ctx: { get: (service) => (service === 'session' ? session : undefined) } };
+/**
+ * A throwaway workspace tree on disk.
+ *
+ * The real file-reference provider reads `agent.session.header.cwd` and scans
+ * that directory, so a stub agent must point at a directory that exists: this
+ * one makes the candidate listing run the provider's own traversal instead of a
+ * mock's.
+ */
+async function makeWorkspaceFixture() {
+  const root = await mkdtemp(join(tmpdir(), 'prompt-forge-workspace-'));
+  sandboxHomes.push(root);
+  await mkdir(join(root, 'web'), { recursive: true });
+  await mkdir(join(root, 'internal', 'handler'), { recursive: true });
+  await writeFile(join(root, 'web', 'admin-login.html'), '<html>login</html>\n', 'utf8');
+  await writeFile(join(root, 'internal', 'handler', 'user.go'), 'package handler\n', 'utf8');
+  return root.replaceAll('\\', '/');
+}
+
+/**
+ * One live agent stand-in, shaped like the real `Agent` the file-reference
+ * provider reads: it carries the session header (`session.header.cwd`) and a
+ * context that resolves this Session.
+ */
+function makeAgent(cwd) {
+  const session = { cwd };
+  return {
+    id: 'session-1',
+    session: { header: { cwd } },
+    ctx: { get: (service) => (service === 'session' ? session : undefined) },
+  };
 }
 
 /* -------------------------------------------------------------------- checks */
@@ -641,7 +678,8 @@ for (const [label, answer, expectations] of [
   const llm = makeLlm(typeof answer === 'string' ? answer : JSON.stringify(answer));
   const index = makeFileIndex();
   const catalog = makeSkillCatalog();
-  const agent = makeAgent();
+  const workspace = await makeWorkspaceFixture();
+  const agent = makeAgent(workspace);
   const services = {
     llm,
     webServer: {},
@@ -660,14 +698,18 @@ for (const [label, answer, expectations] of [
     assert.equal(result.json.prompt, expectations.prompt);
     assert.deepEqual(result.json.files, expectations.files);
     assert.deepEqual(result.json.skills, expectations.skills);
-    assert.deepEqual(index.queries.map((query) => query.query), expectations.queried);
+    /* A bare or slash query is the workspace listing; the rest are nominations. */
+    const nominations = index.queries
+      .map((query) => query.query)
+      .filter((query) => query !== '' && !query.endsWith('/'));
+    assert.deepEqual(nominations, expectations.queried);
     assert.equal(result.json.notes, undefined, 'a healthy pass records no note');
     if (expectations.queried.length > 0) {
       assert.equal(index.queries[0].agent, agent, 'discovery must be scoped to the live agent');
     }
     if (result.json.skills.length > 0) {
       assert.equal(catalog.queried.at(-1).scope, agent, 'the catalog view must be scoped to the live agent');
-      assert.equal(catalog.queried.at(-1).cwd, 'C:/work', 'the catalog view must use the Session working directory');
+      assert.equal(catalog.queried.at(-1).cwd, workspace, 'the catalog view must use the Session working directory');
     }
   });
 }
@@ -676,12 +718,13 @@ for (const [label, answer, expectations] of [
 {
   await freshHome();
   const llm = makeLlm(JSON.stringify({ prompt: 'Rewritten.', files: [], skills: [] }));
+  const workspace = await makeWorkspaceFixture();
   const { ctx, routes } = makeHostContext({
     llm,
     webServer: {},
     fileReferences: makeFileIndex(),
     skills: makeSkillCatalog(),
-    agents: { get: () => makeAgent() },
+    agents: { get: () => makeAgent(workspace) },
     agentDefaultModel: { currentSelection: () => CATALOG.default },
   });
   host.apply(ctx);
@@ -726,12 +769,13 @@ for (const [label, answer, expectations] of [
     })();
   };
   const index = makeFileIndex();
+  const workspace = await makeWorkspaceFixture();
   const { ctx, routes } = makeHostContext({
     llm,
     webServer: {},
     fileReferences: index,
     skills: makeSkillCatalog(),
-    agents: { get: () => makeAgent() },
+    agents: { get: () => makeAgent(workspace) },
     agentDefaultModel: { currentSelection: () => CATALOG.default },
   });
   host.apply(ctx);
@@ -742,33 +786,138 @@ for (const [label, answer, expectations] of [
     assert.equal(result.status, 200, `unexpected body: ${result.body}`);
     assert.equal(llm.calls.length, 2, 'the rewrite plus exactly one nomination call');
     assert.match(llm.calls[1].system, /"files"/, 'the follow-up asks the narrow JSON question');
-    assert.equal(llm.calls[1].messages[0].content[0].text, 'Fix the login flow.',
+    assert.match(llm.calls[1].messages[0].content[0].text, /^Fix the login flow\./,
       'the follow-up receives the finished prompt, not the raw draft');
     assert.equal(result.json.prompt, 'Fix the login flow.\n\n@src/host.js');
     assert.deepEqual(result.json.files, ['src/host.js']);
   });
 }
 
-/* --- 8. an envelope answer costs no second call ------------------------- */
+/* --- 8. an envelope that already names files costs no second call -------- */
 {
   await freshHome();
-  const llm = makeLlm(JSON.stringify({ prompt: 'Fix it.', files: [], skills: [] }));
+  const llm = makeLlm(JSON.stringify({ prompt: 'Fix it.', files: ['src/host'], skills: [] }));
+  const workspace = await makeWorkspaceFixture();
   const { ctx, routes } = makeHostContext({
     llm,
     webServer: {},
     fileReferences: makeFileIndex(),
     skills: makeSkillCatalog(),
-    agents: { get: () => makeAgent() },
+    agents: { get: () => makeAgent(workspace) },
     agentDefaultModel: { currentSelection: () => CATALOG.default },
   });
   host.apply(ctx);
   const result = await callRoute(routes.get('/prompt-forge/optimize'), {
     body: { text: 'fix it', sessionId: 'session-1' },
   });
-  check('an envelope answer stands alone without a nomination call', () => {
+  check('an envelope that names files stands alone without a nomination call', () => {
     assert.equal(result.status, 200);
-    assert.equal(llm.calls.length, 1, 'an obeyed envelope needs no follow-up');
-    assert.equal(result.json.prompt, 'Fix it.');
+    assert.equal(llm.calls.length, 1, 'an envelope that nominated files needs no follow-up');
+    assert.equal(result.json.prompt, 'Fix it.\n\n@src/host.js');
+  });
+}
+
+/* --- 8b. an empty envelope still gets the candidate question ------------- */
+{
+  await freshHome();
+  const replies = [
+    JSON.stringify({ prompt: 'Review the login page.', files: [], skills: [] }),
+    JSON.stringify({ files: ['src/pages/login.html'], skills: [] }),
+  ];
+  const llm = makeLlm('');
+  const recorded = llm.stream.bind(llm);
+  llm.stream = function stream(options) {
+    recorded(options);
+    return (async function* chunks() {
+      yield { type: 'text-delta', index: 0, text: replies.shift() ?? '' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    })();
+  };
+  const index = makeFileIndex();
+  const workspace = await makeWorkspaceFixture();
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    fileReferences: index,
+    skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent(workspace) },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: 'review the login page', sessionId: 'session-1' },
+  });
+  check('an envelope with no files triggers the candidate question with real paths', () => {
+    assert.equal(result.status, 200, `unexpected body: ${result.body}`);
+    assert.equal(llm.calls.length, 2, 'the empty envelope is worth one more question');
+    const question = llm.calls[1].messages[0].content[0].text;
+    assert.match(question, /<workspace_paths>/, `the question must show real paths (notes=${JSON.stringify(result.json.notes)})`);
+    assert.match(question, /web\/admin-login\.html/, 'the listing must reach the login page');
+    assert.equal(result.json.prompt, 'Review the login page.\n\n@src/pages/login.html');
+    assert.deepEqual(result.json.files, ['src/pages/login.html']);
+  });
+}
+
+/* --- 8c. a nomination that hollowed out the prompt is refused ----------- */
+{
+  await freshHome();
+  /* The draft names a file inline; the model keeps the reference but deletes the
+     phrase from the prose, which is the broken sentence this guard exists for. */
+  const llm = makeLlm(JSON.stringify({
+    prompt: '检查与的登录逻辑是否一致',
+    files: ['web/admin-login.html'],
+    skills: [],
+  }));
+  const index = makeFileIndex();
+  const workspace = await makeWorkspaceFixture();
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    fileReferences: index,
+    skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent(workspace) },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: '检查 web/admin-login.html 与后端路由逻辑是否合理', sessionId: 'session-1' },
+  });
+  check('a nomination whose own name was deleted from the prompt is refused', () => {
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json.files, [], 'the reference must not be paid for with a broken sentence');
+    assert.equal(result.json.prompt, '检查与的登录逻辑是否一致',
+      'the prose is returned as the model wrote it');
+    assert.match(String(result.json.notes), /removed those names/, 'the drop is reported, not silent');
+  });
+}
+
+/* --- 8d. a nomination the draft never carried is kept ------------------- */
+{
+  await freshHome();
+  /* The draft does not name the file, so nothing was deleted to nominate it. */
+  const llm = makeLlm(JSON.stringify({
+    prompt: '检查登录流程。',
+    files: ['web/admin-login.html'],
+    skills: [],
+  }));
+  const index = makeFileIndex();
+  const workspace = await makeWorkspaceFixture();
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    fileReferences: index,
+    skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent(workspace) },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: '检查登录流程', sessionId: 'session-1' },
+  });
+  check('a nomination the draft never carried is still appended', () => {
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.json.files, ['web/admin-login.html']);
+    assert.equal(result.json.prompt, '检查登录流程。\n\n@web/admin-login.html');
   });
 }
 

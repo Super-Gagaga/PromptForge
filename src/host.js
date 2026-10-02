@@ -280,6 +280,24 @@ function readRewriteAnswer(text) {
 }
 
 /**
+ * One follow-up question to the model: which of these real files does the task
+ * need?
+ *
+ * This is the second chance for a rewrite whose envelope carried no paths. The
+ * model is shown the workspace's actual paths, so nominating stops being a guess
+ * — and the reference validator still confirms every pick, so a path outside the
+ * listing is simply dropped.
+ */
+const CANDIDATE_SYSTEM_PROMPT = `You pick the files a coding task needs.
+
+You receive a task prompt and a list of paths that really exist in the workspace. Choose the entries the task requires the agent to read or change, and copy their paths exactly as listed. Never invent a path, and never pick an entry the task does not need.
+
+Reply with ONE JSON object and nothing else:
+{ "files": string[], "skills": string[] }
+
+"files" holds paths copied from the list, most relevant first, at most 5. Use an empty array only when no listed path is genuinely relevant. "skills" is usually empty.`;
+
+/**
  * Ask the model once more for the nominations its rewrite omitted.
  *
  * The prompt text is already final by now, so this call only names files and
@@ -290,10 +308,15 @@ function readRewriteAnswer(text) {
  * @param llm - the live LLM service.
  * @param route - the route the rewrite used.
  * @param prompt - the finished rewrite.
+ * @param candidatePaths - real workspace paths to choose from, when available.
  * @returns nominated paths and skill names, empty when the answer is unusable.
  */
-async function nominateReferences(llm, route, prompt) {
-  const text = await callModel(llm, route, NOMINATION_SYSTEM_PROMPT, prompt);
+async function nominateReferences(llm, route, prompt, candidatePaths = []) {
+  const userText = candidatePaths.length === 0
+    ? prompt
+    : `${prompt}\n\n<workspace_paths>\n${candidatePaths.join('\n')}\n</workspace_paths>`;
+  const system = candidatePaths.length === 0 ? NOMINATION_SYSTEM_PROMPT : CANDIDATE_SYSTEM_PROMPT;
+  const text = await callModel(llm, route, system, userText);
   const trimmed = text.trim();
   const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/u.exec(trimmed);
   const body = fenced === null ? trimmed : fenced[1];
@@ -310,6 +333,56 @@ async function nominateReferences(llm, route, prompt) {
   } catch {
     return { files: [], skills: [] };
   }
+}
+
+/**
+ * Build the workspace path listing the candidate question shows.
+ *
+ * The reference index answers a bare query with one directory's entries, so the
+ * overview is a breadth-first walk of its first levels: directories expand until
+ * the budget runs out, which keeps a large tree from flooding the question while
+ * still revealing every top-level area.
+ *
+ * @param service - the file-reference service.
+ * @param agent - live agent whose working directory bounds discovery.
+ * @param signal - cancellation for the listings.
+ * @returns workspace-relative paths, breadth-first, capped by the budget.
+ */
+async function listWorkspacePaths(service, agent, signal) {
+  const paths = [];
+  const seen = new Set();
+  const budget = CANDIDATE_PATH_BUDGET;
+  const collect = (entries) => {
+    const children = [];
+    for (const entry of entries) {
+      if (paths.length >= budget) break;
+      if (seen.has(entry.path)) continue;
+      seen.add(entry.path);
+      paths.push(entry.path);
+      if (entry.kind === 'directory') children.push(`${entry.path}/`);
+    }
+    return children;
+  };
+  const list = async (directory) => {
+    try {
+      return await service.list(agent, directory, signal);
+    } catch {
+      return [];
+    }
+  };
+  const queue = [];
+  for (const name of CANDIDATE_DIRECTORY_HINTS) {
+    if (paths.length >= budget) break;
+    const entries = await list(`${name}/`);
+    if (entries.length > 0) queue.push(...collect(entries));
+  }
+  /* One level deeper, so a monorepo layout still surfaces real files. */
+  while (queue.length > 0 && paths.length < budget) {
+    const directory = queue.shift();
+    if (directory.split('/').filter(Boolean).length > 2) continue;
+    collect(await list(directory));
+  }
+  return paths;
 }
 
 /** Normalize one model-nominated path into the shape the file index speaks. */
@@ -340,6 +413,38 @@ function nominationMatches(path, query) {
   return path.startsWith(query)
     || path.includes(`/${query}`)
     || path.includes(`${query}/`);
+}
+
+/**
+ * Guard the rewrite against a nomination that hollowed out the prompt.
+ *
+ * A model asked to list the files a task needs sometimes *replaces* those
+ * phrases in the prompt with nothing, leaving a sentence like "check the login
+ * logic of and" — the reference moved to the tail and the subject deleted. The
+ * prose is the deliverable and the reference is a convenience, so any nomination
+ * whose own name vanished from a prompt that used to carry it is refused; the
+ * user keeps their sentence and simply gets fewer references.
+ *
+ * @param rewrite - the model's `prompt` field.
+ * @param original - the draft the user typed.
+ * @param nominations - the model's nominated paths.
+ * @returns the nominations that did not cost the prompt any existing text.
+ */
+function keepSafeNominations(rewrite, original, nominations) {
+  const lowerRewrite = rewrite.toLowerCase();
+  const lowerOriginal = original.toLowerCase();
+  return nominations.filter((nomination) => {
+    const query = normalizeQuery(nomination).toLowerCase();
+    if (query === '') return false;
+    /* Only a name the draft actually carried can be "lost". A name the model
+       contributes on its own had nothing to delete. */
+    if (!lowerOriginal.includes(query)) return true;
+    if (lowerRewrite.includes(query)) return true;
+    /* The stem may legitimately change extension or gain a suffix. */
+    const stem = (query.split('/').pop() ?? query).replace(/\.[^.]+$/u, '');
+    if (stem !== '' && lowerRewrite.includes(stem)) return true;
+    return false;
+  });
 }
 
 /**
@@ -486,18 +591,40 @@ async function forgePrompt(ctx, state, text, llm, sessionId) {
   let files = [];
   let skills = [];
   let nominations = { files: answer.files, skills: answer.skills };
-  if (referencesWanted && !answer.enveloped) {
-    /* The model answered in prose, so its nominations never came. Ask the narrow
-       question once; a second failure here still leaves the user their rewrite. */
+  /* Two reasons to ask the narrow question again: the model ignored the envelope
+     and never nominated anything, or it obeyed the envelope but had no idea
+     which files a conceptual task touches. The second case is the common one for
+     a prompt like "check the login page", so the question is accompanied by the
+     workspace's real paths — naming stops being a guess, and the index still
+     confirms every pick. */
+  const needNomination = referencesWanted && (!answer.enveloped || nominations.files.length === 0);
+  if (needNomination) {
+    let candidates = [];
+    if (wantFiles) {
+      try {
+        const service = ctx.get('fileReferences');
+        if (service !== undefined && agent !== undefined) {
+          candidates = await listWorkspacePaths(service, agent, referenceSignal);
+        }
+      } catch (error) {
+        notes.push(`workspace listing failed: ${String(error?.message ?? error)}`);
+      }
+    }
     try {
-      nominations = await nominateReferences(llm, route, answer.prompt);
+      nominations = await nominateReferences(llm, route, answer.prompt, candidates);
     } catch (error) {
       notes.push(`reference nomination failed: ${String(error?.message ?? error)}`);
     }
   }
   if (wantFiles && nominations.files.length > 0) {
+    /* Refuse any nomination whose own name disappeared from the prompt: the
+       reference must never be paid for with a broken sentence. */
+    const safe = keepSafeNominations(answer.prompt, text, nominations.files);
+    if (safe.length < nominations.files.length) {
+      notes.push('some file nominations were dropped because the rewrite had removed those names from the prompt');
+    }
     try {
-      files = await resolveFileReferences(ctx, agent, nominations.files, referenceSignal);
+      files = await resolveFileReferences(ctx, agent, safe, referenceSignal);
     } catch (error) {
       notes.push(String(error?.message ?? error));
     }
