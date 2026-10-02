@@ -61,6 +61,19 @@ const MAX_SKILL_NOMINATIONS = 3;
 const EMPTY_OUTPUT_MESSAGE = 'prompt-forge: the model returned no usable prompt text';
 
 /**
+ * Marker opening the appended file-reference group.
+ *
+ * The wording restates the semantics DSH already teaches the agent for `@`
+ * tokens — a trailing slash is a directory to list, anything else is a file to
+ * read — and adds the part a bare token list leaves implicit: these are tasks to
+ * carry out, not decoration, so a file has to be read before it is used.
+ *
+ * The line is recognized again on the next run, so repeated optimizations
+ * rebuild this group instead of stacking a second heading.
+ */
+const FILE_REFERENCE_MARKER = 'Files this task needs (trailing / means list the directory; read a file before using it):';
+
+/**
  * Marker opening the appended skill-reference block.
  *
  * Each entry is written as the `/name` gesture, which is not decoration: DSH
@@ -972,6 +985,11 @@ function existingFileMentions(prompt) {
  * leading slash command or mention exactly where the author had it — the rewrite
  * contract already forbids moving it.
  *
+ * Each group gets a heading line, the way the skill block does, so a reader sees
+ * what the tokens below it mean. Both headings are ours: a previous run's
+ * heading is recognised and rebuilt rather than stacked, and a heading inside a
+ * code fence is left alone as an example.
+ *
  * @param prompt - the rewritten prompt.
  * @param files - validated file references.
  * @param skills - validated skill references.
@@ -979,25 +997,51 @@ function existingFileMentions(prompt) {
  */
 function appendReferences(prompt, files, skills) {
   const mentions = existingFileMentions(prompt);
-  const escapedMarker = SKILL_REFERENCE_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const blockPattern = new RegExp(`^${escapedMarker}\\r?\\n(?:[\\p{L}\\p{N}_.:/-]+\\r?(?:\\n|$))+`, 'gmu');
+  const escapedSkillMarker = SKILL_REFERENCE_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escapedFileMarker = FILE_REFERENCE_MARKER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const blockPattern = new RegExp(`^${escapedSkillMarker}\\r?\\n(?:[\\p{L}\\p{N}_.:/-]+\\r?(?:\\n|$))+`, 'gmu');
+  /* Our own file group: the heading plus the mention lines it introduces. */
+  const filePattern = new RegExp(`^${escapedFileMarker}\\r?\\n(?:@[^\\r\\n]*\\r?(?:\\n|$))+`, 'gmu');
   const knownSkills = new Set();
-  // Consolidate only our own well-formed blocks, preserving other prose.
-  const base = outsideFences(prompt, (prose) => prose.replace(blockPattern, (block) => {
-    block.split(/\r?\n/u).slice(1).filter(Boolean).forEach((name) => knownSkills.add(name));
-    return '';
-  })).trimEnd();
+  const knownMentions = [];
+  const knownMentionSet = new Set();
+  const keepMention = (token) => {
+    if (knownMentionSet.has(token)) return;
+    knownMentionSet.add(token);
+    knownMentions.push(token);
+  };
+  // Consolidate only our own well-formed groups, preserving other prose.
+  const base = outsideFences(prompt, (prose) => prose
+    .replace(filePattern, (block) => {
+      block.split(/\r?\n/u).slice(1).filter(Boolean).forEach(keepMention);
+      return '';
+    })
+    .replace(blockPattern, (block) => {
+      block.split(/\r?\n/u).slice(1).filter(Boolean).forEach((name) => knownSkills.add(name));
+      return '';
+    })).trimEnd();
   const acceptedFiles = [];
   const acceptedSkills = [];
-  const tokens = [];
-  const render = () => [base, tokens.join('\n'), knownSkills.size > 0
-    ? `${SKILL_REFERENCE_MARKER}\n${[...knownSkills].join('\n')}` : ''].filter(Boolean).join('\n\n');
+  const render = () => [
+    base,
+    /* Existing mentions are re-emitted unchanged; a guard both keeps them and
+       stops an already-mentioned path from being listed twice. */
+    knownMentions.length > 0
+      ? `${FILE_REFERENCE_MARKER}\n${knownMentions.join('\n')}` : '',
+    knownSkills.size > 0 ? `${SKILL_REFERENCE_MARKER}\n${[...knownSkills].join('\n')}` : '',
+  ].filter(Boolean).join('\n\n');
   for (const file of files) {
-    const target = normalizeQuery(file.token);
-    if (mentions.has(target)) continue;
-    tokens.push(file.token);
-    if (render().length > MAX_INPUT_CHARS) { tokens.pop(); continue; }
-    mentions.add(target);
+    /* A mention a previous group already carries is re-emitted as it was; one the
+       prose already used needs no group entry at all. */
+    if (knownMentionSet.has(file.token)) { keepMention(file.token); continue; }
+    if (mentions.has(normalizeQuery(file.token))) continue;
+    keepMention(file.token);
+    if (render().length > MAX_INPUT_CHARS) {
+      knownMentionSet.delete(file.token);
+      knownMentions.pop();
+      continue;
+    }
+    mentions.add(normalizeQuery(file.token));
     acceptedFiles.push(file);
   }
   for (const skill of skills) {

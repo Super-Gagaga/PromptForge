@@ -653,7 +653,7 @@ for (const [label, answer, expectations] of [
       skills: ['office-docx', 'human-only', 'invented-skill'],
     },
     {
-      prompt: 'Fix the login flow.\n\n@src/host.js\n@"src/my module.js"\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx',
+      prompt: 'Fix the login flow.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/host.js\n@"src/my module.js"\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx',
       files: ['src/host.js', 'src/my module.js'],
       skills: ['office-docx'],
       queried: ['src/host', 'my module', 'src/does-not-exist'],
@@ -672,7 +672,7 @@ for (const [label, answer, expectations] of [
   [
     'accepts a fenced JSON answer',
     '```json\n{"prompt":"Fix the login flow.","files":["src/host"],"skills":[]}\n```',
-    { prompt: 'Fix the login flow.\n\n@src/host.js', files: ['src/host.js'], skills: [], queried: ['src/host'] },
+    { prompt: 'Fix the login flow.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/host.js', files: ['src/host.js'], skills: [], queried: ['src/host'] },
   ],
 ]) {
   await freshHome();
@@ -839,7 +839,7 @@ for (const [label, answer, expectations] of [
     assert.match(llm.calls[1].system, /"files"/, 'the follow-up asks the narrow JSON question');
     assert.match(llm.calls[1].messages[0].content[0].text, /^Fix the login flow\./,
       'the follow-up receives the finished prompt, not the raw draft');
-    assert.equal(result.json.prompt, 'Fix the login flow.\n\n@src/host.js');
+    assert.equal(result.json.prompt, 'Fix the login flow.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/host.js');
     assert.deepEqual(result.json.files, ['src/host.js']);
   });
 }
@@ -878,7 +878,7 @@ for (const [label, answer, expectations] of [
     assert.equal(llm.calls.length, 2, 'the empty skill list is worth one more question');
     assert.match(llm.calls[1].messages[0].content[0].text, /<available_skills>/,
       'the skill question must offer the real catalog');
-    assert.equal(result.json.prompt, 'Fix it.\n\n@src/host.js\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx');
+    assert.equal(result.json.prompt, 'Fix it.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/host.js\n\nSkills this task may need (each line is a /command the agent loads):\n/office-docx');
     assert.deepEqual(result.json.files, ['src/host.js']);
     assert.deepEqual(result.json.skills, ['office-docx']);
   });
@@ -920,7 +920,7 @@ for (const [label, answer, expectations] of [
     const question = llm.calls[1].messages[0].content[0].text;
     assert.match(question, /<workspace_paths>/, `the question must show real paths (notes=${JSON.stringify(result.json.notes)})`);
     assert.match(question, /web\/admin-login\.html/, 'the listing must reach the login page');
-    assert.equal(result.json.prompt, 'Review the login page.\n\n@src/pages/login.html');
+    assert.equal(result.json.prompt, 'Review the login page.\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@src/pages/login.html');
     assert.deepEqual(result.json.files, ['src/pages/login.html']);
   });
 }
@@ -1097,9 +1097,11 @@ for (const scenario of [
     const first=appendReferences('Review.\\n\\n@src/host.js', [file], [doc]);
     const second=appendReferences(first.prompt,[file],[doc]);
     const merged=appendReferences(first.prompt,[],[{name:'office-xlsx'}]);
+    const refiled=appendReferences(first.prompt,[{path:'src/other.js',kind:'file',token:'@src/other.js'}],[]);
     const fenced=appendReferences('Example:\\n\\n\\x60\\x60\\x60text\\n'+SKILL_REFERENCE_MARKER+'\\noffice-docx\\n\\x60\\x60\\x60',[],[doc]);
+    const fencedFiles=appendReferences('Example:\\n\\n\\x60\\x60\\x60text\\n'+FILE_REFERENCE_MARKER+'\\n@example.js\\n\\x60\\x60\\x60',[],[]);
     const limited=appendReferences('x'.repeat(MAX_INPUT_CHARS-1),[file],[doc]);
-    return {first,second,merged,fenced,limited};
+    return {first,second,merged,refiled,fenced,fencedFiles,limited};
   })()`, sandbox);
   check('repeated reference appends are idempotent and counts include only new entries', () => {
     assert.equal(composition.first.files.length, 0);
@@ -1110,9 +1112,27 @@ for (const scenario of [
     assert.ok(composition.merged.prompt.endsWith('/office-docx\n/office-xlsx'),
       'consolidated skill rows keep the gesture form');
   });
-  check('managed skill blocks inside code fences are preserved as examples', () => {
+  check('the file group carries one heading, rebuilt rather than stacked', () => {
+    const heading = 'Files this task needs';
+    /* The draft already carried the mention, so no file group is created and the
+       mention stays exactly where the author had it — the skill block is the
+       only thing this pass appends. */
+    assert.equal(composition.first.files.length, 0);
+    assert.ok(!composition.first.prompt.includes(heading), composition.first.prompt);
+    assert.ok(composition.first.prompt.startsWith('Review.\n\n@src/host.js'), composition.first.prompt);
+    assert.equal(composition.second.prompt, composition.first.prompt);
+    /* A second run with a genuinely new path groups it under one heading. */
+    const added = composition.refiled;
+    assert.equal(added.files.length, 1);
+    assert.equal(added.prompt.split(heading).length, 2, added.prompt);
+    assert.ok(added.prompt.includes(`${heading} (trailing / means list the directory; read a file before using it):\n@src/other.js`),
+      added.prompt);
+  });
+  check('managed skill and file groups inside code fences are preserved as examples', () => {
     assert.equal(composition.fenced.prompt.split('Skills this task may need').length, 3);
     assert.equal(composition.fenced.skills.length, 1);
+    assert.equal(composition.fencedFiles.prompt.split('Files this task needs').length, 2,
+      'a fenced example must survive untouched');
   });
   check('reference length overflow omits additions without truncating the prose', () => {
     assert.equal(composition.limited.prompt, 'x'.repeat(59999));
@@ -1221,7 +1241,7 @@ for (const scenario of [
   check('a nomination the draft never carried is still appended', () => {
     assert.equal(result.status, 200);
     assert.deepEqual(result.json.files, ['web/admin-login.html']);
-    assert.equal(result.json.prompt, '检查登录流程。\n\n@web/admin-login.html');
+    assert.equal(result.json.prompt, '检查登录流程。\n\nFiles this task needs (trailing / means list the directory; read a file before using it):\n@web/admin-login.html');
   });
 }
 

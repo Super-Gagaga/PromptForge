@@ -60,6 +60,19 @@ const MAX_SKILL_NOMINATIONS = 3;
 const EMPTY_OUTPUT_MESSAGE = 'prompt-forge: the model returned no usable prompt text';
 
 /**
+ * Marker opening the appended file-reference group.
+ *
+ * The wording restates the semantics DSH already teaches the agent for `@`
+ * tokens — a trailing slash is a directory to list, anything else is a file to
+ * read — and adds the part a bare token list leaves implicit: these are tasks to
+ * carry out, not decoration, so a file has to be read before it is used.
+ *
+ * The line is recognized again on the next run, so repeated optimizations
+ * rebuild this group instead of stacking a second heading.
+ */
+const FILE_REFERENCE_MARKER = 'Files this task needs (trailing / means list the directory; read a file before using it):';
+
+/**
  * Marker opening the appended skill-reference block.
  *
  * Each entry is written as the `/name` gesture, which is not decoration: DSH
