@@ -733,24 +733,71 @@ for (const [label, answer, expectations] of [
   });
   host.apply(ctx);
   const off = await callRoute(routes.get('/prompt-forge/state'), {
-    body: { referenceFiles: false, referenceSkills: false },
+    body: { referenceFiles: false, skillMode: 'off' },
   });
-  check('both reference toggles default to on and persist when switched off', () => {
+  check('the file toggle and the skill tier persist their own values', () => {
     assert.equal(off.status, 200);
     assert.equal(off.json.referenceFiles, false);
-    assert.equal(off.json.referenceSkills, false);
+    assert.equal(off.json.skillMode, 'off');
   });
 
   const withFiles = await callRoute(routes.get('/prompt-forge/state'), { body: { referenceFiles: true } });
   await callRoute(routes.get('/prompt-forge/optimize'), { body: { text: 'hi', sessionId: 'session-1' } });
   const instruction = llm.calls[0].system;
-  check('the envelope instruction asks only for what the toggles enabled', () => {
+  check('the envelope instruction asks only for what is enabled', () => {
     assert.equal(withFiles.json.referenceFiles, true);
-    assert.equal(withFiles.json.referenceSkills, false);
+    assert.equal(withFiles.json.skillMode, 'off');
     assert.match(instruction, /"files"/);
     assert.doesNotMatch(instruction, /"skills"/, 'a disabled feature must not be requested');
     assert.doesNotMatch(instruction, /Reply with the rewritten prompt only/,
       'the JSON contract must replace the plain-text contract, not compete with it');
+  });
+
+  /* The tier must reach the model, or the setting would be decorative. */
+  const instructions = {};
+  for (const tier of ['strict', 'balanced', 'eager']) {
+    await callRoute(routes.get('/prompt-forge/state'), { body: { skillMode: tier } });
+    llm.calls.length = 0;
+    await callRoute(routes.get('/prompt-forge/optimize'), { body: { text: 'hi', sessionId: 'session-1' } });
+    instructions[tier] = llm.calls[0].system;
+  }
+  check('each skill tier words the request differently', () => {
+    assert.match(instructions.strict, /only when the request names the capability/);
+    assert.match(instructions.balanced, /only skills you are confident exist/);
+    assert.match(instructions.eager, /could plausibly improve/);
+    const distinct = new Set(Object.values(instructions));
+    assert.equal(distinct.size, 3, 'three tiers must produce three distinct instructions');
+  });
+}
+
+/* --- 6b. an older document's boolean survives the tier upgrade ------------ */
+{
+  const home = await freshHome();
+  /* Exactly what the previous build wrote: `referenceSkills` as a boolean. */
+  await writeFile(join(home, 'prompt-forge.json'), JSON.stringify({
+    provider: '',
+    model: '',
+    reasoningEffort: '',
+    systemPrompt: '',
+    referenceFiles: true,
+    referenceSkills: false,
+  }), 'utf8');
+  const { ctx, routes } = makeHostContext({ webServer: {} });
+  host.apply(ctx);
+  const read = await callRoute(routes.get('/prompt-forge/state'), { method: 'GET' });
+  check('a stored boolean migrates: true is balanced, false is off', () => {
+    assert.equal(read.status, 200);
+    assert.equal(read.json.skillMode, 'off', 'a disabled feature must stay disabled');
+    assert.equal(read.json.referenceFiles, true);
+    assert.equal(read.json.provider, '', 'the rest of the old document survives');
+  });
+
+  await writeFile(join(home, 'prompt-forge.json'), JSON.stringify({ referenceSkills: true }), 'utf8');
+  const { ctx: ctx2, routes: routes2 } = makeHostContext({ webServer: {} });
+  host.apply(ctx2);
+  const read2 = await callRoute(routes2.get('/prompt-forge/state'), { method: 'GET' });
+  check('an enabled boolean migrates to balanced, not to eager', () => {
+    assert.equal(read2.json.skillMode, 'balanced');
   });
 }
 
@@ -1625,7 +1672,7 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
       'the effort rows must come from the catalog of the selected model');
   });
 
-  /* The two reference switches: present, on by default, and writable. The page
+  /* The reference controls: a file switch plus a skill tier dropdown. The page
      is walked through both the component and its output, so rows are deduped. */
   const switchesOf = (tree) => {
     const found = [];
@@ -1637,26 +1684,41 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
     });
     return found;
   };
+  const skillPicker = () => find(remount(), (node) => node.type === 'button'
+    && node.props['aria-haspopup'] === 'listbox'
+    && node.props['aria-label'] === 'reference.skills');
   const switches = switchesOf(remount());
-  check('the settings page offers a reference-file switch and a reference-skill switch', () => {
-    assert.deepEqual(switches.map((node) => node.props['aria-label']),
-      ['reference.files', 'reference.skills']);
-    assert.deepEqual(switches.map((node) => node.props['aria-checked']), [true, true],
-      'both reference features default to on');
+  check('the settings page offers a reference-file switch and a skill tier dropdown', () => {
+    assert.deepEqual(switches.map((node) => node.props['aria-label']), ['reference.files']);
+    assert.equal(switches[0].props['aria-checked'], true, 'file references default to on');
+    assert.notEqual(skillPicker(), null, 'the skill tier control must render');
   });
 
-  switches[1].props.onClick();
-  await new Promise((resolve) => setTimeout(resolve, 5));
-  check('flipping a switch persists exactly that preference', () => {
-    const write = fetches.filter((entry) => entry.url === '/prompt-forge/state' && entry.init?.method === 'POST').at(-1);
-    assert.notEqual(write, undefined, 'the flip must persist');
-    const body = JSON.parse(write.init.body);
-    assert.equal(body.referenceSkills, false, 'the flipped switch must be persisted');
-    assert.equal(body.referenceFiles, true, 'the untouched switch must keep its value');
+  /* The tier menu offers all four levels, with balanced marked current. */
+  skillPicker().props.onClick();
+  const tierKeys = ['off', 'strict', 'balanced', 'eager'];
+  const tierOptions = optionsOf(remount()).filter((option) => tierKeys.includes(optionKey(option)));
+  check('the skill tier menu offers off, strict, balanced and eager', () => {
+    assert.deepEqual(tierOptions.map(optionKey), ['off', 'strict', 'balanced', 'eager']);
+    const selected = tierOptions.filter((option) => option.props['aria-selected'] === true);
+    assert.equal(selected.length, 1, 'exactly one tier may be current');
+    assert.equal(optionKey(selected[0]), 'balanced', 'a fresh install is balanced');
   });
-  check('the flipped switch reads back as off', () => {
-    const after = switchesOf(remount());
-    assert.deepEqual(after.map((node) => node.props['aria-checked']), [true, false]);
+
+  const strictRow = optionsOf(remount()).find((option) => optionKey(option) === 'strict');
+  strictRow.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  check('choosing a tier persists it without disturbing the file switch', () => {
+    const write = fetches.filter((entry) => entry.url === '/prompt-forge/state' && entry.init?.method === 'POST').at(-1);
+    assert.notEqual(write, undefined, 'the choice must persist');
+    const body = JSON.parse(write.init.body);
+    assert.equal(body.skillMode, 'strict', 'the chosen tier must be persisted');
+    assert.equal(body.referenceFiles, true, 'the file switch must keep its value');
+  });
+  check('the tier reads back as the chosen one', () => {
+    const picker = skillPicker();
+    const label = find(picker, (node) => node.props?.className === 'PF-pickerValue');
+    assert.equal(String(label.props.children), 'reference.skillMode.strict');
   });
 }
 

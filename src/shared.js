@@ -94,6 +94,71 @@ function formatFileMention(path, kind) {
 }
 
 /**
+ * How eagerly the rewrite nominates skills.
+ *
+ * The catalog a workspace exposes is not always relevant to the request, and the
+ * model's willingness to name an entry swings widely between "only if certain"
+ * and "anything plausibly useful". One fixed wording cannot serve both, so the
+ * tier the user picks is the wording the model receives.
+ *
+ * The values are the stored strings, so a hand-edited settings file stays
+ * readable and an older boolean is migrated by `normalizeState`.
+ */
+const SKILL_MODES = ['off', 'strict', 'balanced', 'eager'];
+
+/** The tier a workspace with no stored preference gets. */
+const DEFAULT_SKILL_MODE = 'balanced';
+
+/**
+ * The skill half of the envelope request, worded for one tier.
+ *
+ * @param mode - one of `SKILL_MODES`.
+ * @returns the instruction line.
+ */
+function skillNominationRule(mode) {
+  switch (mode) {
+    case 'strict':
+      return 'For "skills": list a skill only when the request names the capability it provides or the task cannot be done without it; at most 2, empty otherwise.';
+    case 'eager':
+      return 'For "skills": list every skill that could plausibly improve this task, most useful first, up to 3. Include a skill when a reasonable colleague would consider using it, even if the request does not name it.';
+    default:
+      return 'For "skills": list only skills you are confident exist and that this task needs, at most 3. Use an empty array when none apply.';
+  }
+}
+
+/**
+ * The skill half of the candidate question, worded for one tier.
+ *
+ * The listing is the same either way; only the bar for choosing from it moves,
+ * so the tier never widens what can be referenced — the catalog still has the
+ * final say on whether the name exists.
+ *
+ * @param mode - one of `SKILL_MODES`.
+ * @param hasCandidates - whether the real catalog was handed over.
+ * @returns the instruction line.
+ */
+function skillCandidateRule(mode, hasCandidates) {
+  if (!hasCandidates) {
+    switch (mode) {
+      case 'strict':
+        return 'Do not nominate skills unless the request explicitly needs one; an empty array is the normal answer.';
+      case 'eager':
+        return 'Name any skill that would plausibly help, up to 3, even when the request does not name the capability.';
+      default:
+        return 'Nominate at most 3 skill names you are confident exist and this task needs.';
+    }
+  }
+  switch (mode) {
+    case 'strict':
+      return 'For "skills": choose a name from <available_skills> only when the request names that capability or the task cannot be done without it, at most 2. An empty array is the normal answer.';
+    case 'eager':
+      return 'For "skills": choose up to 3 names from <available_skills> that would plausibly improve this task, most useful first — include one when a reasonable colleague would consider using it, even if the request does not name it.';
+    default:
+      return 'For "skills": choose at most 3 names from <available_skills> that this task would genuinely benefit from, exactly as listed. An empty array is correct only when none of them help.';
+  }
+}
+
+/**
  * The output contract the default instruction states, and the marker that lets
  * the envelope request replace it.
  *
@@ -117,10 +182,11 @@ const PLAIN_OUTPUT_CONTRACT = `Output contract:
  * hallucinated path out of the prompt.
  *
  * @param files - whether file nominations are collected.
- * @param skills - whether skill nominations are collected.
+ * @param skillMode - the skill tier, or `'off'` to collect none.
  * @returns the instruction, or an empty string when neither is enabled.
  */
-function buildEnvelopeInstruction(files, skills) {
+function buildEnvelopeInstruction(files, skillMode) {
+  const skills = skillMode !== 'off';
   if (!files && !skills) return '';
   const fields = ['"prompt": string — the rewritten prompt'];
   if (files) fields.push('"files": string[] — workspace-relative paths, or distinctive path fragments');
@@ -134,9 +200,7 @@ function buildEnvelopeInstruction(files, skills) {
     rules.push('- For "files": list only files this task genuinely depends on, most relevant first, at most 5. Give the most specific path you can justify from the request; when you cannot name a real path, use a distinctive fragment of one. Never invent a file you have no reason to believe exists, and never list a file the request does not need.');
     rules.push('- "files" is a separate index of what the agent should open. It is NEVER a substitute for the prompt text: keep every subject, noun, and path the author wrote exactly where it belongs in "prompt". Deleting a phrase from "prompt" because it also appears in "files" produces a broken sentence and is not allowed.');
   }
-  if (skills) {
-    rules.push('- For "skills": list only skills you are confident exist and that this task needs, at most 3. Use an empty array when none apply.');
-  }
+  if (skills) rules.push(`- ${skillNominationRule(skillMode)}`);
   rules.push('- Include every field even when it is empty, and prefer an empty list over a guess.');
   return `\n\n${rules.join('\n')}`;
 }
@@ -146,11 +210,11 @@ function buildEnvelopeInstruction(files, skills) {
  *
  * @param systemPrompt - the user's configured instruction.
  * @param files - whether file nominations are collected.
- * @param skills - whether skill nominations are collected.
+ * @param skillMode - the skill tier, or `'off'` to collect none.
  * @returns the instruction the model receives.
  */
-function composeSystemPrompt(systemPrompt, files, skills) {
-  const envelope = buildEnvelopeInstruction(files, skills);
+function composeSystemPrompt(systemPrompt, files, skillMode) {
+  const envelope = buildEnvelopeInstruction(files, skillMode);
   if (envelope === '') return systemPrompt;
   return `${systemPrompt.replace(PLAIN_OUTPUT_CONTRACT, '').trimEnd()}${envelope}`;
 }
@@ -194,6 +258,18 @@ ${PLAIN_OUTPUT_CONTRACT}`;
 /* ------------------------------------------------------------------ settings */
 
 /**
+ * Coerce one stored skill tier, including the boolean this setting replaced.
+ *
+ * @param value - stored `skillMode`, or the older `referenceSkills` boolean.
+ * @returns one of `SKILL_MODES`.
+ */
+function normalizeSkillMode(value) {
+  if (typeof value === 'string' && SKILL_MODES.includes(value)) return value;
+  if (typeof value === 'boolean') return value ? 'balanced' : 'off';
+  return DEFAULT_SKILL_MODE;
+}
+
+/**
  * Coerce one stored document onto the defaults.
  *
  * A stored file may be truncated, hand-edited, or written by an older build, so
@@ -216,7 +292,9 @@ function normalizeState(input) {
     /* Both reference features are opt-out: an older document without the fields
        keeps them enabled, which is what a fresh install gets too. */
     referenceFiles: flag(source.referenceFiles, true),
-    referenceSkills: flag(source.referenceSkills, true),
+    /* The skill tier replaces an earlier on/off boolean: `true` was the tier this
+       build calls `balanced`, and `false` was no nominations at all. */
+    skillMode: normalizeSkillMode(source.skillMode ?? source.referenceSkills),
   };
 }
 

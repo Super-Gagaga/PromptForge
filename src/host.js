@@ -264,7 +264,8 @@ function parseWholeObject(text) {
  * @param text - the assistant text exactly as streamed.
  * @returns the rewrite, any nominations, and whether an envelope arrived.
  */
-function readRewriteAnswer(text, files = true, skills = true) {
+function readRewriteAnswer(text, files = true, skillMode = DEFAULT_SKILL_MODE) {
+  const skills = skillMode !== 'off';
   const parsed = files || skills ? parseWholeObject(text) : null;
   const validList = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string');
   if (parsed !== null && typeof parsed.prompt === 'string'
@@ -294,7 +295,8 @@ function readRewriteAnswer(text, files = true, skills = true) {
  * @param signal - bounded nomination deadline within the reference stage.
  * @returns nominated paths and skill names, empty when the answer is unusable.
  */
-async function nominateReferences(llm, route, prompt, candidatePaths = [], candidateSkills = [], files = true, skills = true, signal) {
+async function nominateReferences(llm, route, prompt, candidatePaths = [], candidateSkills = [], skillMode = DEFAULT_SKILL_MODE, files = true, signal) {
+  const skills = skillMode !== 'off';
   const supplied = [
     candidatePaths.length === 0 ? '' : `<workspace_paths>\n${candidatePaths.join('\n')}\n</workspace_paths>`,
     candidateSkills.length === 0 ? '' : `<available_skills>\n${candidateSkills.join('\n')}\n</available_skills>`,
@@ -304,13 +306,10 @@ async function nominateReferences(llm, route, prompt, candidatePaths = [], candi
   const fileRule = candidatePaths.length === 0
     ? 'Nominate at most 5 workspace-relative file paths or distinctive fragments, most relevant first.'
     : 'For "files": copy at most 5 paths from <workspace_paths>, most relevant first. Never invent a path and never copy an entry the task does not need.';
-  const skillRule = candidateSkills.length === 0
-    ? 'Nominate at most 3 skill names you are confident exist and this task needs.'
-    : 'For "skills": choose at most 3 names from <available_skills> that this task would genuinely benefit from, exactly as listed. An empty array is correct only when none of them help.';
   const system = `You extract references required by a coding task.
 Reply with ONE JSON object and nothing else: { ${fields.join(', ')} }.
 ${files ? fileRule : 'Do not nominate files.'}
-${skills ? skillRule : 'Do not nominate skills.'}
+${skills ? skillCandidateRule(skillMode, candidateSkills.length > 0) : 'Do not nominate skills.'}
 Use empty arrays when nothing applies.`;
   const text = await withSignal(() => callModel(llm, route, system, userText, signal), signal);
   const parsed = parseWholeObject(text);
@@ -710,13 +709,14 @@ async function forgePrompt(ctx, state, text, llm, sessionId) {
   }
   const route = resolveRoute(llm, ctx.get('agentDefaultModel'), state);
   const wantFiles = state.referenceFiles;
-  const wantSkills = state.referenceSkills;
+  const skillMode = state.skillMode;
+  const wantSkills = skillMode !== 'off';
   const answer = readRewriteAnswer(await callModel(
     llm,
     route,
-    composeSystemPrompt(state.systemPrompt, wantFiles, wantSkills),
+    composeSystemPrompt(state.systemPrompt, wantFiles, skillMode),
     `Rewrite the following composer text.\n\n<composer_text>\n${text}\n</composer_text>`,
-  ), wantFiles, wantSkills);
+  ), wantFiles, skillMode);
   if (answer.prompt === '') throw new Error(EMPTY_OUTPUT_MESSAGE);
   if (answer.prompt.length > MAX_INPUT_CHARS) {
     throw new Error('the optimized prompt came back longer than the composer limit');
@@ -788,7 +788,7 @@ async function forgePrompt(ctx, state, text, llm, sessionId) {
       const nominationSignal = AbortSignal.any([referenceSignal, AbortSignal.timeout(nominationBudget)]);
       try {
         const nominations = await nominateReferences(llm, route, answer.prompt, candidates, candidateSkills,
-          needFiles, needSkills, nominationSignal);
+          needSkills ? skillMode : 'off', needFiles, nominationSignal);
         await resolve(nominations, needFiles, needSkills);
       } catch (error) {
         notes.push(`reference nomination failed: ${String(error?.message ?? error)}`);

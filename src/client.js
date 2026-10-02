@@ -71,6 +71,14 @@ const zh = {
   'reference.filesHint': '由模型提名、再经当前工作区的文件索引校验；只保留真实存在的路径。',
   'reference.skills': '引用技能',
   'reference.skillsHint': '由模型提名、再经技能目录校验；命中的技能会以名称列出。',
+  'reference.skillMode.off': '关闭',
+  'reference.skillMode.offHint': '不引用任何技能。',
+  'reference.skillMode.strict': '严格',
+  'reference.skillMode.strictHint': '只有请求明确需要某项能力时才引用，最多 2 个；通常为空。',
+  'reference.skillMode.balanced': '均衡',
+  'reference.skillMode.balancedHint': '只引用确实有帮助的技能，最多 3 个。',
+  'reference.skillMode.eager': '宽松',
+  'reference.skillMode.eagerHint': '只要可能有用就引用，最多 3 个；不确定时倾向给出。',
   'toggle.on': '开',
   'toggle.off': '关',
   'nav': '提示词优化',
@@ -127,6 +135,14 @@ const en = {
   'reference.filesHint': 'The model nominates paths and the workspace file index confirms them; only paths that really exist survive.',
   'reference.skills': 'Reference skills',
   'reference.skillsHint': 'The model nominates names and the skill catalog confirms them; matches are listed by name.',
+  'reference.skillMode.off': 'Off',
+  'reference.skillMode.offHint': 'Never reference a skill.',
+  'reference.skillMode.strict': 'Strict',
+  'reference.skillMode.strictHint': 'Reference a skill only when the request names that capability, at most 2; usually none.',
+  'reference.skillMode.balanced': 'Balanced',
+  'reference.skillMode.balancedHint': 'Reference only skills that genuinely help, at most 3.',
+  'reference.skillMode.eager': 'Eager',
+  'reference.skillMode.eagerHint': 'Reference any skill that could help, at most 3; prefer naming one when unsure.',
   'toggle.on': 'On',
   'toggle.off': 'Off',
   'nav': 'Prompt Forge',
@@ -231,6 +247,7 @@ const CSS = `
 .PF-toggle{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
 .PF-toggleCopy{display:flex;flex-direction:column;gap:2px;min-width:0}
 .PF-toggleLabel{color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
+.PF-togglePicker{flex:none;width:132px}
 .PF-switch{display:inline-flex;align-items:center;gap:8px;flex:none;padding:2px 0;border:0;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}
 .PF-switch:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}
 .PF-switch:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px;border-radius:var(--dsw-radius-sm)}
@@ -903,6 +920,46 @@ function ReferenceToggle(props) {
   ]);
 }
 
+/**
+ * The skill-reference tier: how willing the rewrite should be to pick a skill.
+ *
+ * The same dropdown the model and effort rows use, so the three choices read as
+ * one control family. `off` is one of the tiers, which is why this replaced the
+ * old on/off switch instead of sitting beside it.
+ */
+function SkillModePicker(props) {
+  const { settings, t } = props;
+  const tiers = ['strict', 'balanced', 'eager'];
+  /* The Host normalizes the stored value, so anything unknown here is a page
+     rendered before the settings arrived; it shows the default in that window. */
+  const current = tiers.includes(settings?.skillMode) || settings?.skillMode === 'off'
+    ? settings.skillMode
+    : 'balanced';
+  return ReactRuntime.createElement('div', { className: 'PF-toggle' }, [
+    ReactRuntime.createElement('div', { key: 'copy', className: 'PF-toggleCopy' }, [
+      ReactRuntime.createElement('span', { key: 'label', className: 'PF-toggleLabel' }, t('reference.skills')),
+      ReactRuntime.createElement('span', { key: 'hint', className: 'PF-hint' }, t(`reference.skillMode.${current}Hint`)),
+    ]),
+    ReactRuntime.createElement('div', { key: 'picker', className: 'PF-togglePicker' },
+      ReactRuntime.createElement(Picker, {
+        label: t(`reference.skillMode.${current}`),
+        ariaLabel: t('reference.skills'),
+        menuAriaLabel: t('reference.skills'),
+        disabled: settings === undefined,
+        onSelect: (key) => settingsStore.patch({ skillMode: key }),
+      }, (choose) => ReactRuntime.createElement('div', { className: 'PF-menuRow' }, [
+        ...['off', ...tiers].map((mode) => ReactRuntime.createElement(PickerOption, {
+          key: mode,
+          optionKey: mode,
+          selected: current === mode,
+          name: t(`reference.skillMode.${mode}`),
+          hint: t(`reference.skillMode.${mode}Hint`),
+          onSelect: () => choose(mode),
+        })),
+      ]))),
+  ]);
+}
+
 /** The PromptForge settings page. */
 function PromptForgeSettings(props) {
   const t = props.t;
@@ -1014,15 +1071,13 @@ function PromptForgeSettings(props) {
         offLabel: t('toggle.off'),
         onChange: (next) => settingsStore.patch({ referenceFiles: next }),
       }),
-      ReactRuntime.createElement(ReferenceToggle, {
+      /* The skill side is a tier rather than a switch: the catalog a workspace
+         exposes is not always relevant, and how willing the model should be to
+         pick from it is the user's call, not a fixed policy. */
+      ReactRuntime.createElement(SkillModePicker, {
         key: 'skills',
-        label: t('reference.skills'),
-        hint: t('reference.skillsHint'),
-        checked: settings?.referenceSkills !== false,
-        disabled: settings === undefined,
-        onLabel: t('toggle.on'),
-        offLabel: t('toggle.off'),
-        onChange: (next) => settingsStore.patch({ referenceSkills: next }),
+        settings,
+        t,
       }),
     ]),
 
