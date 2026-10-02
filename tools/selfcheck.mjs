@@ -981,6 +981,49 @@ for (const scenario of [
     },
   });
   runInContext(source, sandbox);
+  const rewritePolicy = runInContext(`({
+    legacy: LEGACY_DEFAULT_SYSTEM_PROMPT,
+    fresh: normalizeState({}).systemPrompt,
+    migrated: normalizeState({systemPrompt: LEGACY_DEFAULT_SYSTEM_PROMPT}).systemPrompt,
+    custom: normalizeState({systemPrompt: 'Use my concise house style.'}).systemPrompt,
+    minimal: composeSystemPrompt(DEFAULT_SYSTEM_PROMPT, false, false),
+    references: composeSystemPrompt(DEFAULT_SYSTEM_PROMPT, true, true),
+    customReferences: composeSystemPrompt('Use my concise house style.', true, false)
+  })`, sandbox);
+  check('saved legacy defaults migrate to minimal editing while custom instructions survive', () => {
+    assert.equal(rewritePolicy.migrated, rewritePolicy.fresh);
+    assert.equal(rewritePolicy.custom, 'Use my concise house style.');
+    assert.ok(rewritePolicy.customReferences.startsWith('Use my concise house style.'));
+  });
+  const migrationHome = await freshHome();
+  await writeFile(join(migrationHome, 'prompt-forge.json'), JSON.stringify({
+    systemPrompt: rewritePolicy.legacy, referenceFiles: false, referenceSkills: false,
+  }));
+  const migrationLlm = makeLlm('把按钮文案改成“保存”');
+  const migrationHost = makeHostContext({
+    llm: migrationLlm, webServer: {}, agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(migrationHost.ctx);
+  const migrationState = await callRoute(migrationHost.routes.get('/prompt-forge/state'), { method: 'GET' });
+  await callRoute(migrationHost.routes.get('/prompt-forge/optimize'), { body: { text: '把按钮文案改成“保存”' } });
+  check('a stored old default is migrated before it reaches the rewrite model', () => {
+    assert.equal(migrationState.json.systemPrompt, rewritePolicy.fresh);
+    assert.match(migrationLlm.calls[0].system, /Default to minimal editing/);
+    assert.equal(migrationLlm.calls.length, 1);
+  });
+  check('minimal rewrite policy avoids invented scope while retaining explicit complex requirements', () => {
+    assert.match(rewritePolicy.minimal, /Default to minimal editing/);
+    assert.match(rewritePolicy.minimal, /Missing context is not permission to invent/);
+    assert.match(rewritePolicy.minimal, /Do not add plans, implementation steps/);
+    assert.match(rewritePolicy.minimal, /must remain intact/);
+    assert.doesNotMatch(rewritePolicy.minimal, /make the goal, the relevant context, the expected deliverable/);
+  });
+  check('reference envelopes preserve the minimal rewrite policy without conflicting output contracts', () => {
+    assert.match(rewritePolicy.references, /Default to minimal editing/);
+    assert.match(rewritePolicy.references, /Reference collection does not enlarge the task/);
+    assert.match(rewritePolicy.references, /ONE JSON object/);
+    assert.doesNotMatch(rewritePolicy.references, /Reply with the rewritten prompt only/);
+  });
   const envelopeResults = runInContext(`[
     readRewriteAnswer('Explain this JSON example: {"prompt":"example value"}'),
     readRewriteAnswer('{"prompt":"example value"}', false, false),

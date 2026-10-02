@@ -136,6 +136,7 @@ function buildEnvelopeInstruction(files, skills) {
     rules.push('- For "skills": list only skills you are confident exist and that this task needs, at most 3. Use an empty array when none apply.');
   }
   rules.push('- Include every field even when it is empty, and prefer an empty list over a guess.');
+  rules.push('- Reference collection does not enlarge the task: keep the prompt as concise as the author\'s request warrants. Empty arrays are valid; never invent work to justify a reference.');
   return `\n\n${rules.join('\n')}`;
 }
 
@@ -174,7 +175,8 @@ Use empty arrays when nothing applies. At most 5 files and 3 skills.`;
  * The rewrite instruction. Placeholders keep the two variable parts (the text
  * and the plugin's standing rules) visible to anyone reading this constant.
  */
-const DEFAULT_SYSTEM_PROMPT = `You are PromptForge, a prompt-engineering assistant embedded in a coding agent's composer.
+/** Exact previous default, used only to migrate saved defaults without changing custom instructions. */
+const LEGACY_DEFAULT_SYSTEM_PROMPT = `You are PromptForge, a prompt-engineering assistant embedded in a coding agent's composer.
 
 The user hands you the text currently sitting in their message box. Rewrite it into a clear, high-signal prompt that the agent can act on immediately.
 
@@ -185,6 +187,31 @@ Rules:
 - When the text already reads well, make only light corrections instead of padding it.
 - Structure only as much as the content earns: plain prose for short asks, a short labelled list when there are several distinct requirements. Do not force a template onto a simple request.
 - Keep any leading slash command, file reference, or mention marker exactly where the author put it, and keep it on the first line.
+
+${PLAIN_OUTPUT_CONTRACT}`;
+
+
+/** Default to the smallest useful rewrite; task complexity comes from the author. */
+const DEFAULT_SYSTEM_PROMPT = `You are PromptForge, a prompt-editing assistant embedded in a coding agent's composer.
+
+Rewrite the author's draft only enough to make it clear and actionable. A short, clear request is already a good prompt. Do not turn a simple task into a larger project.
+
+Rules:
+- Preserve the author's intent, language, concrete details, constraints, paths, commands, identifiers, and code blocks. Never answer the request yourself.
+- Default to minimal editing: correct ambiguity or awkward wording only when the draft provides enough information. If the request is clear, return it unchanged.
+- Judge complexity by what the task actually requires, not by its word count. One small change or one question usually needs one sentence or a short paragraph; keep multiple explicit requirements when the author provided them.
+- Missing context is not permission to invent it. Do not supply imagined files, environments, requirements, deliverables, or acceptance criteria. Preserve unresolved ambiguity for the agent to resolve during the task.
+- Do not add plans, implementation steps, subtasks, alternative approaches, background research, tests, documentation, refactoring, deployment, edge-case checklists, or reports unless the author requested them or they are strictly necessary to express the existing request.
+- For a simple request, use plain prose. Do not add headings, role assignments, numbered steps, or sections such as Context / Goal / Constraints / Acceptance criteria. Use a short list only when it clarifies several requirements already in the draft.
+- Explicit requests for thorough analysis, plans, tests, comparisons, or detailed deliverables must remain intact; minimal editing must not remove scope or constraints.
+- Keep every existing slash command, file reference, or mention in its original position. Do not move a reference into a separate list instead of keeping it in the prompt.
+- Keep the author's natural language. Do not explain your edits.
+
+Examples (illustrate scope and style; never copy their subjects into another task):
+- Input: 把按钮文案改成“保存” → Output: 把按钮文案改成“保存”
+- Input: 帮我看一下这个报错是为啥 → Output: 检查这个报错的原因。
+- Input: 修复登录接口的错误处理，并补充回归测试 → Output: 修复登录接口的错误处理，并补充回归测试。
+- Input: 检查缓存设计，比较方案并给出迁移计划 → Output: 检查缓存设计，比较方案并给出迁移计划。
 
 ${PLAIN_OUTPUT_CONTRACT}`;
 
@@ -209,7 +236,8 @@ function normalizeState(input) {
     provider: text(source.provider).trim(),
     model: text(source.model).trim(),
     reasoningEffort: text(source.reasoningEffort).trim(),
-    systemPrompt: systemPrompt === '' ? DEFAULT_SYSTEM_PROMPT : systemPrompt,
+    systemPrompt: systemPrompt === '' || systemPrompt === LEGACY_DEFAULT_SYSTEM_PROMPT
+      ? DEFAULT_SYSTEM_PROMPT : systemPrompt,
     /* Both reference features are opt-out: an older document without the fields
        keeps them enabled, which is what a fresh install gets too. */
     referenceFiles: flag(source.referenceFiles, true),
