@@ -11,8 +11,12 @@ DSH 提示词优化插件。输入框有文字时，在发送控件旁显示提�
 优化是独立模型请求，不会修改聊天会话的模型或思考强度，也不会作为聊天消息写入会话。请求期间若编辑草稿、提交消息或切换会话，较晚返回的结果会被丢弃。调用失败时保留原草稿，可在设置页查看错误。
 
 ## 安装
+1.进入dsh的插件 --> 添加插件 --> 输入：
+```
+https://github.com/Super-Gagaga/PromptForge.git
+```
 
-克隆本仓库后重新构建，再重启 DSH 或重新加载插件：
+2.克隆本仓库后重新构建，再重启 DSH 或重新加载插件：
 
 ```powershell
 git clone https://github.com/Super-Gagaga/PromptForge.git
