@@ -288,21 +288,30 @@ function readRewriteAnswer(text, files = true, skills = true) {
  * @param route - the route the rewrite used.
  * @param prompt - the finished rewrite.
  * @param candidatePaths - real workspace paths to choose from, when available.
+ * @param candidateSkills - the skills this agent can load, when available.
  * @param files - whether missing file nominations should be requested.
  * @param skills - whether missing skill nominations should be requested.
  * @param signal - bounded nomination deadline within the reference stage.
  * @returns nominated paths and skill names, empty when the answer is unusable.
  */
-async function nominateReferences(llm, route, prompt, candidatePaths = [], files = true, skills = true, signal) {
-  const userText = candidatePaths.length === 0
-    ? prompt
-    : `${prompt}\n\n<workspace_paths>\n${candidatePaths.join('\n')}\n</workspace_paths>`;
+async function nominateReferences(llm, route, prompt, candidatePaths = [], candidateSkills = [], files = true, skills = true, signal) {
+  const supplied = [
+    candidatePaths.length === 0 ? '' : `<workspace_paths>\n${candidatePaths.join('\n')}\n</workspace_paths>`,
+    candidateSkills.length === 0 ? '' : `<available_skills>\n${candidateSkills.join('\n')}\n</available_skills>`,
+  ].filter(Boolean);
+  const userText = supplied.length === 0 ? prompt : `${prompt}\n\n${supplied.join('\n\n')}`;
   const fields = [files ? '"files": string[]' : '', skills ? '"skills": string[]' : ''].filter(Boolean);
+  const fileRule = candidatePaths.length === 0
+    ? 'Nominate at most 5 workspace-relative file paths or distinctive fragments, most relevant first.'
+    : 'For "files": copy at most 5 paths from <workspace_paths>, most relevant first. Never invent a path and never copy an entry the task does not need.';
+  const skillRule = candidateSkills.length === 0
+    ? 'Nominate at most 3 skill names you are confident exist and this task needs.'
+    : 'For "skills": choose at most 3 names from <available_skills> that this task would genuinely benefit from, exactly as listed. An empty array is correct only when none of them help.';
   const system = `You extract references required by a coding task.
 Reply with ONE JSON object and nothing else: { ${fields.join(', ')} }.
-${files ? 'Nominate at most 5 relevant workspace-relative file paths or distinctive fragments. When workspace_paths is provided, copy only relevant paths from that list.' : 'Do not nominate files.'}
-${skills ? 'Nominate at most 3 skill names you are confident exist and this task needs.' : 'Do not nominate skills.'}
-Use empty arrays when nothing applies. Do not invent references.`;
+${files ? fileRule : 'Do not nominate files.'}
+${skills ? skillRule : 'Do not nominate skills.'}
+Use empty arrays when nothing applies.`;
   const text = await withSignal(() => callModel(llm, route, system, userText, signal), signal);
   const parsed = parseWholeObject(text);
   const valid = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string');
@@ -562,6 +571,41 @@ async function resolveSkillReferences(hostCtx, agent, cwd, nominations, signal) 
     .map((skill) => ({ name: skill.name, description: skill.description }));
 }
 
+/**
+ * List the skills this agent can actually load.
+ *
+ * The nomination question can only choose a skill it can see, and a model has no
+ * way to read the catalog itself — asked to name skills unaided, it correctly
+ * answers "none" rather than guess. Files already get a real-path listing for
+ * exactly this reason; skills need the same, or a request like "write me a
+ * résumé" never reaches the office skill that exists for it.
+ *
+ * Only model-invocable entries are listed: the reference block tells the agent to
+ * load one with its `skill` tool, so a human-only skill would be a dead end.
+ *
+ * @param hostCtx - host context carrying the optional skills service.
+ * @param agent - live agent whose scope and working directory select the layers.
+ * @param cwd - the Session's working directory, when known.
+ * @param signal - cancellation for discovery.
+ * @returns `name — description` lines, catalog order, capped by the budget.
+ */
+async function listAvailableSkills(hostCtx, agent, cwd, signal) {
+  const service = hostCtx.get('skills');
+  if (service === undefined || agent === undefined) return [];
+  try {
+    const catalog = await withSignal(() => service.list({ scope: agent, ...(cwd === undefined ? {} : { cwd }), signal }), signal);
+    return catalog
+      .filter((skill) => skill.invocation?.modelInvocable === true)
+      .slice(0, CANDIDATE_SKILL_BUDGET)
+      .map((skill) => (typeof skill.description === 'string' && skill.description !== ''
+        ? `${skill.name} — ${skill.description}`
+        : skill.name));
+  } catch {
+    /* A catalog that cannot be read simply leaves the question without skills. */
+    return [];
+  }
+}
+
 /** Transform only prose regions, keeping fenced examples intact. */
 function outsideFences(prompt, transform) {
   let fence = null;
@@ -714,9 +758,11 @@ async function forgePrompt(ctx, state, text, llm, sessionId) {
   };
   await resolve(answer, wantFiles, wantSkills);
   const needFiles = wantFiles && files.length === 0;
-  // An explicit empty skill list is a valid answer; retry missing or invalid skills.
-  const needSkills = wantSkills && skills.length === 0
-    && (!answer.enveloped || answer.skills.length > 0);
+  /* Both sides ask the same way: an empty result means "ask once more, with the
+     real candidates in hand". Files were already doing this; skills were not,
+     which is why a résumé request never reached the office skill — the model was
+     asked to name skills it had no way to see, and correctly answered "none". */
+  const needSkills = wantSkills && skills.length === 0;
   if ((wantFiles || wantSkills) && agent === undefined) notes.push('reference processing unavailable: no live agent');
   if (needFiles && ctx.get('fileReferences') === undefined) notes.push('file reference index unavailable');
   if (needSkills && ctx.get('skills') === undefined) notes.push('skill catalog unavailable');
@@ -729,12 +775,19 @@ async function forgePrompt(ctx, state, text, llm, sessionId) {
         candidates = await listWorkspacePaths(service, agent, discoverySignal, text, notes);
       }
     }
+    /* Skills get the same treatment as paths: the model cannot read the catalog,
+       so an unaided "name the skills you are confident exist" reliably answers
+       "none" and a résumé request never reaches the office skill that exists for
+       it. Listing them turns the question into a choice. */
+    const candidateSkills = needSkills
+      ? await listAvailableSkills(ctx, agent, cwd, referenceSignal)
+      : [];
     // Reserve time for validation inside the single reference-stage deadline.
     const nominationBudget = referenceDeadline - Date.now() - 3000;
     if (nominationBudget > 0) {
       const nominationSignal = AbortSignal.any([referenceSignal, AbortSignal.timeout(nominationBudget)]);
       try {
-        const nominations = await nominateReferences(llm, route, answer.prompt, candidates,
+        const nominations = await nominateReferences(llm, route, answer.prompt, candidates, candidateSkills,
           needFiles, needSkills, nominationSignal);
         await resolve(nominations, needFiles, needSkills);
       } catch (error) {

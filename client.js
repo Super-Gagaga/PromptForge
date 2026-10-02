@@ -41,6 +41,9 @@ const REFERENCE_TIMEOUT_MS = 15000;
 /** Most workspace paths shown to the candidate question. */
 const CANDIDATE_PATH_BUDGET = 160;
 
+/** Most skills listed for the candidate question. */
+const CANDIDATE_SKILL_BUDGET = 40;
+
 /**
  * Directory names the candidate listing probes.
  *

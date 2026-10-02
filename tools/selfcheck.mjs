@@ -797,10 +797,22 @@ for (const [label, answer, expectations] of [
   });
 }
 
-/* --- 8. an envelope that already names files costs no second call -------- */
+/* --- 8. a named file is kept, and the skill side still gets its question -- */
 {
   await freshHome();
-  const llm = makeLlm(JSON.stringify({ prompt: 'Fix it.', files: ['src/host'], skills: [] }));
+  const replies = [
+    JSON.stringify({ prompt: 'Fix it.', files: ['src/host'], skills: [] }),
+    JSON.stringify({ files: [], skills: ['office-docx'] }),
+  ];
+  const llm = makeLlm('');
+  const recorded = llm.stream.bind(llm);
+  llm.stream = function stream(options) {
+    recorded(options);
+    return (async function* chunks() {
+      yield { type: 'text-delta', index: 0, text: replies.shift() ?? '' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    })();
+  };
   const workspace = await makeWorkspaceFixture();
   const { ctx, routes } = makeHostContext({
     llm,
@@ -814,10 +826,14 @@ for (const [label, answer, expectations] of [
   const result = await callRoute(routes.get('/prompt-forge/optimize'), {
     body: { text: 'fix it', sessionId: 'session-1' },
   });
-  check('an envelope that names files stands alone without a nomination call', () => {
+  check('a named file is kept and the skill side gets its own question', () => {
     assert.equal(result.status, 200);
-    assert.equal(llm.calls.length, 1, 'an envelope that nominated files needs no follow-up');
-    assert.equal(result.json.prompt, 'Fix it.\n\n@src/host.js');
+    assert.equal(llm.calls.length, 2, 'the empty skill list is worth one more question');
+    assert.match(llm.calls[1].messages[0].content[0].text, /<available_skills>/,
+      'the skill question must offer the real catalog');
+    assert.equal(result.json.prompt, 'Fix it.\n\n@src/host.js\n\nSkills this task may need (load one with the skill tool by name):\noffice-docx');
+    assert.deepEqual(result.json.files, ['src/host.js']);
+    assert.deepEqual(result.json.skills, ['office-docx']);
   });
 }
 
@@ -910,13 +926,13 @@ for (const scenario of [
   },
   {
     label: 'invalid initial file nominations get a validated fallback',
-    replies: [{ prompt: 'Review.', files: ['src/missing.js'], skills: [] }, { files: ['src/host.js'] }],
-    files: ['src/host.js'], skills: [], calls: 2,
+    replies: [{ prompt: 'Review.', files: ['src/missing.js'], skills: [] }, { files: ['src/host.js'], skills: ['office-docx'] }],
+    files: ['src/host.js'], skills: ['office-docx'], calls: 2,
   },
   {
-    label: 'an explicit empty skill-only answer does not trigger a second call',
+    label: 'an empty skill answer still gets the question, and an empty catalog keeps it empty',
     settings: { referenceFiles: false },
-    replies: [{ prompt: 'Review.', skills: [] }], files: [], skills: [], calls: 1,
+    replies: [{ prompt: 'Review.', skills: [] }, { skills: [] }], files: [], skills: [], calls: 2,
   },
   {
     label: 'invalid skills can be supplemented without replacing valid files',
@@ -926,8 +942,8 @@ for (const scenario of [
   {
     label: 'lost original paths restore the draft even without model nominations',
     text: 'Review src/host.js.',
-    replies: [{ prompt: 'Review.', files: [], skills: [] }],
-    files: [], skills: [], calls: 1, prompt: 'Review src/host.js.',
+    replies: [{ prompt: 'Review src/host.js.', files: [], skills: [] }, { skills: [] }],
+    files: [], skills: [], calls: 2, prompt: 'Review src/host.js.',
   },
 ]) {
   await freshHome();
@@ -1158,6 +1174,52 @@ for (const scenario of [
     assert.equal(result.status, 200);
     assert.deepEqual(result.json.files, ['web/admin-login.html']);
     assert.equal(result.json.prompt, '检查登录流程。\n\n@web/admin-login.html');
+  });
+}
+
+/* --- 8e. a résumé request reaches the skill that exists for it ---------- */
+{
+  await freshHome();
+  /* The rewrite obeys the envelope but names nothing, which is what this model
+     does for any request that does not contain a path. The skills the workspace
+     offers must reach it as candidates, or "write me a résumé" never finds the
+     office document skill. */
+  const replies = [
+    JSON.stringify({ prompt: '使用可用的相关技能，为我撰写一份简历。', files: [], skills: [] }),
+    JSON.stringify({ files: [], skills: ['office-docx'] }),
+  ];
+  const llm = makeLlm('');
+  const recorded = llm.stream.bind(llm);
+  llm.stream = function stream(options) {
+    recorded(options);
+    return (async function* chunks() {
+      yield { type: 'text-delta', index: 0, text: replies.shift() ?? '' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    })();
+  };
+  const workspace = await makeWorkspaceFixture();
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    fileReferences: makeFileIndex(),
+    skills: makeSkillCatalog(),
+    agents: { get: () => makeAgent(workspace) },
+    agentDefaultModel: { currentSelection: () => CATALOG.default },
+  });
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: '帮我写一份简历', sessionId: 'session-1' },
+  });
+  check('a résumé request reaches the office skill through the candidate catalog', () => {
+    assert.equal(result.status, 200, `unexpected body: ${result.body}`);
+    assert.equal(llm.calls.length, 2, 'an empty skill list is worth one question');
+    const question = llm.calls[1].messages[0].content[0].text;
+    assert.match(question, /<available_skills>/, 'the question must offer the real catalog');
+    assert.match(question, /office-docx/, 'the catalog must reach the question');
+    assert.doesNotMatch(question, /human-only/, 'a human-only skill is never offered');
+    assert.deepEqual(result.json.skills, ['office-docx']);
+    assert.match(result.json.prompt, /office-docx/);
+    assert.equal(result.json.referenceStatus, 'complete');
   });
 }
 
