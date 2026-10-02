@@ -44,13 +44,44 @@ const check = (label, fn) => {
 
 /* ------------------------------------------------------------- React stub */
 
-/** Minimal hook runtime: enough to render one pass of each component. */
+/** Minimal hook runtime: enough to render, re-render, and commit effects. */
 function installReact() {
   const states = [];
   let cursor = 0;
   const effects = [];
   const refs = [];
   const cleanups = [];
+  let current = null;
+  let effectSeq = 0;
+
+  /**
+   * Expand one element into its rendered tree, as React would.
+   *
+   * Function components are invoked here so a walker can reach the markup they
+   * return — the plugin's pickers and rows are all plain components. A resolved
+   * node keeps its own identity under `rendered`, so a predicate can match
+   * either the component or its output.
+   */
+  const resolve = (element) => {
+    if (element === null || element === undefined || typeof element !== 'object') return element;
+    if (Array.isArray(element)) return element.map(resolve);
+    if (typeof element.type !== 'function') return element;
+    return { ...element, rendered: resolve(element.type(element.props)) };
+  };
+
+  const render = () => {
+    cursor = 0;
+    effectSeq = 0;
+    return resolve(current.component(current.props));
+  };
+
+  /** A state setter that re-renders the mounted component, as React would. */
+  const setter = (index) => (next) => {
+    const value = typeof next === 'function' ? next(states[index]) : next;
+    if (Object.is(value, states[index])) return;
+    states[index] = value;
+    if (current !== null) render();
+  };
 
   const React = {
     createElement(type, props, ...children) {
@@ -67,12 +98,12 @@ function installReact() {
       const index = cursor;
       cursor += 1;
       if (!(index in states)) states[index] = typeof initial === 'function' ? initial() : initial;
-      return [states[index], (next) => {
-        states[index] = typeof next === 'function' ? next(states[index]) : next;
-      }];
+      return [states[index], setter(index)];
     },
     useEffect(effect) {
-      effects.push(effect);
+      const index = effectSeq;
+      effectSeq += 1;
+      effects.push({ index, effect });
     },
     useRef(initial) {
       const index = cursor;
@@ -102,19 +133,40 @@ function installReact() {
     refs.length = 0;
     effects.length = 0;
     cleanups.length = 0;
+    current = null;
+  };
+
+  /** Mount one component; state changes re-render it with the same props. */
+  const mount = (component, props) => {
+    current = { component, props };
+    return render();
   };
 
   /** Run the effects a render registered — React's post-commit phase. */
   const flushEffects = () => {
-    for (const effect of effects.splice(0, effects.length)) {
-      const cleanup = effect();
-      if (typeof cleanup === 'function') cleanups.push(cleanup);
+    for (const entry of effects.splice(0, effects.length)) {
+      while (cleanups.length > entry.index) {
+        const cleanup = cleanups.pop();
+        if (typeof cleanup === 'function') cleanup();
+      }
+      while (cleanups.length < entry.index) cleanups.push(undefined);
+      const cleanup = entry.effect();
+      cleanups.push(typeof cleanup === 'function' ? cleanup : undefined);
     }
   };
 
-  return { React, reset, effects, flushEffects,
-    rerender: () => { cursor = 0; effects.length = 0; },
-    unmount: () => { for (const cleanup of cleanups.splice(0)) cleanup(); },
+  return { React, reset, mount, effects, flushEffects,
+    /** Re-render the mounted instance in place; effects stay to the caller. */
+    rerender: () => {
+      cursor = 0;
+      effectSeq = 0;
+      if (current !== null) return render();
+      return null;
+    },
+    unmount: () => {
+      current = null;
+      for (const cleanup of cleanups.splice(0)) if (typeof cleanup === 'function') cleanup();
+    },
   };
 }
 
@@ -127,25 +179,49 @@ function installPrimitives() {
   };
   return {
     IconLoadingOutlineRegular: icon('loading'),
+    IconCheckOutlineRegular: icon('check'),
+    IconChevronDownOutlineRegular: icon('chevron-down'),
+    StateDot: (props) => ({ type: 'state-dot', props: props ?? {} }),
+    MenuGroup: (props) => ({ type: 'menu-group', props: props ?? {} }),
     Tooltip: function Tooltip(props) {
       return props.children;
     },
   };
 }
 
+/**
+ * Visit every node of a rendered tree.
+ *
+ * A node carries its own children under `props.children`; a function component
+ * is expanded on visit, so a walker reaches the markup the plugin's pickers and
+ * rows return instead of stopping at the component element. The expansion is
+ * cached on the element itself, because invoking a component twice would run its
+ * hooks twice — and a fresh element from an earlier render must not be reused
+ * once a re-render has replaced it.
+ */
+const EXPANDED = Symbol('pf.expanded');
+function walkTree(node, visit) {
+  if (node === null || node === undefined || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (const child of node) walkTree(child, visit);
+    return;
+  }
+  visit(node);
+  walkTree(node.props?.children, visit);
+  if (typeof node.type !== 'function') return;
+  if (!Object.prototype.hasOwnProperty.call(node, EXPANDED)) {
+    node[EXPANDED] = node.type(node.props);
+  }
+  walkTree(node[EXPANDED], visit);
+}
+
 /** Walk a rendered tree for the first node whose type matches. */
 function find(node, predicate) {
-  if (node === null || node === undefined) return null;
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      const hit = find(child, predicate);
-      if (hit !== null) return hit;
-    }
-    return null;
-  }
-  if (typeof node !== 'object') return null;
-  if (predicate(node)) return node;
-  return find(node.props?.children, predicate);
+  let hit = null;
+  walkTree(node, (candidate) => {
+    if (hit === null && predicate(candidate)) hit = candidate;
+  });
+  return hit;
 }
 
 /* -------------------------------------------------------- browser-half load */
@@ -506,12 +582,25 @@ const fetches = [];
 let answers = [];
 /** The page `fetch` the bundle reaches its Host through. */
 const realFetch = globalThis.fetch;
+/** The durable settings document the state route answers with. */
+const STATE_DOCUMENT = {
+  provider: '',
+  model: '',
+  reasoningEffort: '',
+  systemPrompt: 'Rewrite the draft.',
+};
 globalThis.fetch = (url, init) => {
   fetches.push({ url, init });
-  const answer = answers.shift() ?? {
-    status: 200,
-    body: { prompt: 'OPTIMIZED', route: { provider: 'deepseek-account', model: 'deepseek-flash' } },
-  };
+  const isState = url === '/prompt-forge/state';
+  const isWrite = init?.method === 'POST';
+  const answer = answers.shift() ?? (isState && !isWrite
+    ? { status: 200, body: STATE_DOCUMENT }
+    : isState
+      ? { status: 200, body: { ...STATE_DOCUMENT, ...JSON.parse(init.body) } }
+      : {
+        status: 200,
+        body: { prompt: 'OPTIMIZED', route: { provider: 'deepseek-account', model: 'deepseek-flash' } },
+      });
   return Promise.resolve({
     ok: answer.status >= 200 && answer.status < 300,
     status: answer.status,
@@ -721,43 +810,120 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
   });
 }
 
-/* --- 10. the settings page renders the live catalog -------------------- */
+/* --- 10. the settings page renders the live catalog in dropdowns ------- */
 {
   /* The catalog arrives over the Remote namespace, so commit once to run the
-     page's effects, let the load settle, then render the populated page. */
+     page's effects, let the load settle, then re-render the populated page. */
   react.reset();
-  section.component({ t: clientRun.ctx.locale.bind('dsh-prompt-forge') });
-  react.flushEffects();
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  react.reset();
-  const tree = section.component({
-    t: clientRun.ctx.locale.bind('dsh-prompt-forge'),
-  });
-  const selects = [];
-  const walk = (node) => {
-    if (node === null || node === undefined || typeof node !== 'object') return;
-    if (Array.isArray(node)) {
-      for (const child of node) walk(child);
-      return;
+  const props = { t: clientRun.ctx.locale.bind('dsh-prompt-forge') };
+  const remount = () => react.mount(section.component, props);
+  /** The trigger button of the one dropdown whose label matches. */
+  const triggerFor = (tree, ariaLabel) => find(tree, (node) => node.type === 'button'
+    && node.props['aria-haspopup'] === 'listbox'
+    && node.props['aria-label'] === ariaLabel);
+  /** The rows of whichever panel is currently open, deduplicated by row key. */
+  const optionsOf = (tree) => {
+    const options = [];
+    walkTree(tree, (node) => {
+      if (node.type === 'button' && node.props.role === 'option') options.push(node);
+    });
+    const unique = [];
+    const seen = new Set();
+    for (const option of options) {
+      const key = option.props['data-key'];
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(option);
     }
-    if (node.type === 'select') selects.push(node);
-    walk(node.props?.children);
+    return unique;
   };
-  walk(tree);
-  check('the settings page renders a model select and an effort select', () => {
-    assert.equal(selects.length, 2, `expected two selects, saw ${selects.length}`);
-    const modelOptions = selects[0].props.children.length;
-    assert.ok(modelOptions >= 2, 'the model select needs a default option plus catalog entries');
-    assert.equal(selects[0].props.disabled, false, 'the catalog is populated in this harness');
+  /** The group headings of the open panel, in order and deduplicated. */
+  const groupLabelsOf = (tree) => {
+    const labels = [];
+    walkTree(tree, (node) => {
+      if (node.type === 'menu-group' && !labels.includes(node.props.label)) labels.push(node.props.label);
+    });
+    return labels;
+  };
+  /** The row key one option was built from: `''` is the follow-default row. */
+  const optionKey = (option) => option.props['data-key'];
+
+  /* The catalog arrives over the Remote namespace, so mount once to commit the
+     page's effects, let the settings and catalog loads settle, then re-render. */
+  react.reset();
+  react.mount(section.component, props);
+  react.flushEffects();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  react.reset();
+  const tree = remount();
+  const modelTrigger = triggerFor(tree, 'model.aria');
+  const effortTrigger = triggerFor(tree, 'effort.heading');
+
+  check('the settings page renders a model dropdown and an effort dropdown', () => {
+    assert.notEqual(modelTrigger, null, 'the model dropdown must render');
+    assert.notEqual(effortTrigger, null, 'the effort dropdown must render');
+    assert.equal(modelTrigger.props.disabled, false, 'the catalog is populated in this harness');
+    assert.equal(modelTrigger.props['aria-expanded'], false, 'the panel starts closed');
   });
-  check('the effort select offers the live levels of the selected model', () => {
-    const options = selects[1].props.children.map((option) => option.props.value);
-    assert.deepEqual(options, ['', 'low', 'max'], 'the effort options must come from the catalog');
-    assert.equal(selects[1].props.disabled, false);
+
+  check('the model trigger names the deployment default while following it', () => {
+    const label = find(modelTrigger, (node) => node.props?.className === 'PF-pickerValue');
+    assert.match(String(label.props.children), /DeepSeek \/ DeepSeek Flash/);
   });
-  check('the model select names the deployment default', () => {
-    const label = selects[0].props.children[0].props.children;
-    assert.match(label, /DeepSeek \/ DeepSeek Flash/);
+
+  /* Open the model panel: rows come from the live catalog, grouped by provider. */
+  modelTrigger.props.onClick();
+  const opened = remount();
+  const options = optionsOf(opened);
+
+  check('the open model panel groups the follow-default row apart from the providers', () => {
+    assert.equal(triggerFor(opened, 'model.aria').props['aria-expanded'], true, 'the panel opened');
+    assert.deepEqual(groupLabelsOf(opened), ['model.followingGroup', 'DeepSeek']);
+    assert.deepEqual(options.map(optionKey), ['', 'deepseek-account\u0000deepseek-flash'],
+      'the panel must list the follow-default row plus every catalog model');
+  });
+
+  check('the panel marks the follow-default row as current, and only that row', () => {
+    if (options.filter((option) => option.props['aria-selected'] === true).length !== 1) {
+      process.stderr.write(`DEBUG rows=${JSON.stringify(options.map((o) => [o.props['data-key'], o.props['aria-selected']]))}\n`);
+    }
+    const selected = options.filter((option) => option.props['aria-selected'] === true);
+    assert.equal(selected.length, 1, 'exactly one row may be current');
+    assert.equal(optionKey(selected[0]), '');
+  });
+
+  check('the panel paints the shipped check mark on the current row', () => {
+    const current = options.find((option) => option.props['aria-selected'] === true);
+    const glyph = find(current, (node) => typeof node.type === 'function' && node.type.__iconName !== undefined);
+    assert.notEqual(glyph, null, 'the current row must draw its check');
+    assert.equal(glyph.type.__iconName, 'check');
+  });
+
+  /* Picking a concrete model clears the stale effort and names itself. */
+  const concrete = options.find((option) => optionKey(option) !== '');
+  concrete.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  check('choosing a model writes the pair and clears the previous effort', () => {
+    const write = fetches.filter((entry) => entry.url === '/prompt-forge/state' && entry.init?.method === 'POST').at(-1);
+    assert.notEqual(write, undefined, 'the choice must persist');
+    const body = JSON.parse(write.init.body);
+    assert.equal(body.provider, 'deepseek-account');
+    assert.equal(body.model, 'deepseek-flash');
+    assert.equal(body.reasoningEffort, '');
+  });
+
+  check('the trigger now names the chosen model instead of the default', () => {
+    const label = find(triggerFor(remount(), 'model.aria'), (node) => node.props?.className === 'PF-pickerValue');
+    assert.equal(String(label.props.children), 'DeepSeek / DeepSeek Flash');
+  });
+
+  check('the effort dropdown offers the live levels of the selected model', () => {
+    const picker = triggerFor(remount(), 'effort.heading');
+    assert.equal(picker.props.disabled, false, 'the selected model exposes effort levels');
+    picker.props.onClick();
+    const effortOptions = optionsOf(remount());
+    assert.deepEqual(effortOptions.map(optionKey), ['', 'low', 'max'],
+      'the effort rows must come from the catalog of the selected model');
   });
 }
 
@@ -765,19 +931,41 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
 {
   const previousFetch = globalThis.fetch;
   const requests = [];
-  const renderSettings = () => {
+  const props = { t: clientRun.ctx.locale.bind('dsh-prompt-forge') };
+  const mountSettings = () => {
     react.reset();
-    return section.component({ t: clientRun.ctx.locale.bind('dsh-prompt-forge') });
+    return react.mount(section.component, props);
   };
+  const trigger = (tree, label) => find(tree, (node) => node.type === 'button'
+    && node.props['aria-haspopup'] === 'listbox'
+    && node.props['aria-label'] === label);
+  const row = (tree, key) => find(tree, (node) => node.type === 'button'
+    && node.props.role === 'option'
+    && node.props['data-key'] === key);
   globalThis.fetch = (url, init) => {
     if (url !== '/prompt-forge/state' || init?.method !== 'POST') return previousFetch(url, init);
     return new Promise((resolve) => requests.push({ body: JSON.parse(init.body), resolve }));
   };
   try {
-    let tree = renderSettings();
-    const effort = find(tree, (node) => node.type === 'select' && node.props['aria-label'] === 'effort.heading');
-    effort.props.onChange({ target: { value: 'low' } });
-    effort.props.onChange({ target: { value: 'max' } });
+    /* Picking two effort levels back to back must not queue two writes. Each
+       step remounts, because opening the panel re-renders the page. */
+    /* Picking two effort levels back to back must not queue two writes. The
+       opener is clicked on the mounted page and the same instance re-renders,
+       so the panel that just opened is the one walked next. */
+    const openEffort = () => {
+      const tree = mountSettings();
+      trigger(tree, 'effort.heading').props.onClick();
+      return react.rerender();
+    };
+    const low = row(openEffort(), 'low');
+    if (low === null) {
+      process.stderr.write(`DEBUG requests=${requests.length}\n`);
+      assert.fail('the effort panel did not open');
+    }
+    low.props.onClick();
+    const max = row(openEffort(), 'max');
+    if (max === null) assert.fail('the reopened effort panel has no max row');
+    max.props.onClick();
     check('rapid settings changes serialize writes', () => { assert.equal(requests.length, 1); });
     requests[0].resolve({ ok: true, status: 200, json: async () => requests[0].body });
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -787,9 +975,9 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
     });
     requests[1].resolve({ ok: false, status: 500, json: async () => ({ error: 'write failed' }) });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    tree = renderSettings();
+    const failed = mountSettings();
     check('HTTP save failures are rendered without an unhandled rejection', () => {
-      assert.ok(find(tree, (node) => node.props?.['data-tone'] === 'error'));
+      assert.ok(find(failed, (node) => node.props?.['data-tone'] === 'error'));
     });
   } finally { globalThis.fetch = previousFetch; }
 }

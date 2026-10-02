@@ -85,7 +85,7 @@ function normalizeState(input) {
 
 /** The defaults, built through the same validator so the shapes cannot drift. */
 const DEFAULT_STATE = normalizeState({});
-		const { IconLoadingOutlineRegular, Tooltip } = require("@deepseek-ai/dsh-client-ui-primitives");
+		const { IconCheckOutlineRegular, IconChevronDownOutlineRegular, IconLoadingOutlineRegular, MenuGroup, Tooltip } = require("@deepseek-ai/dsh-client-ui-primitives");
 /**
  * dsh-prompt-forge — browser half.
  *
@@ -114,6 +114,7 @@ const DEFAULT_STATE = normalizeState({});
  * factory (the offline self-check does exactly that).
  */
 const ReactRuntime = typeof React === 'undefined' ? require('react') : React;
+const { useEffect, useRef, useState } = ReactRuntime;
 
 /** A text-and-spark mark that follows the button's theme and state colors. */
 function PromptForgeTextSparkIcon({ size = 20, ...props }) {
@@ -141,6 +142,15 @@ const zh = {
   'model.heading': '模型',
   'model.hint': '使用 DSH 已配置的模型；此处列出的就是当前可路由的全部模型。',
   'model.default': '跟随默认模型（{name}）',
+  'model.followingGroup': '默认',
+  'model.search': '搜索模型…',
+  'model.empty': '没有匹配的模型。',
+  'model.aria': '选择模型，当前 {name}',
+  'model.listAria': '模型列表',
+  'model.statusLoading': '正在读取模型目录…',
+  'model.statusError': '模型目录读取失败：{message}',
+  'model.statusFailed': '不可用的提供方：{message}',
+  'model.statusEmpty': '当前 DSH 没有可用的模型。',
   'effort.heading': '思考强度',
   'effort.hint': '选“默认”时由模型自己决定强度。',
   'effort.default': '默认',
@@ -170,6 +180,15 @@ const en = {
   'model.heading': 'Model',
   'model.hint': 'Uses the models DSH already has configured; this list is exactly what can be routed right now.',
   'model.default': 'Follow the default model ({name})',
+  'model.followingGroup': 'Default',
+  'model.search': 'Search models…',
+  'model.empty': 'No matching model.',
+  'model.aria': 'Select model, current {name}',
+  'model.listAria': 'Model list',
+  'model.statusLoading': 'Loading the model catalog…',
+  'model.statusError': 'The model catalog could not be loaded: {message}',
+  'model.statusFailed': 'Unavailable provider: {message}',
+  'model.statusEmpty': 'This DSH composition exposes no model.',
   'effort.heading': 'Reasoning effort',
   'effort.hint': '"Default" lets the model decide its own effort.',
   'effort.default': 'Default',
@@ -229,14 +248,32 @@ const CSS = `
 .PF-intro{margin:0;color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:20px}
 .PF-card{display:flex;flex-direction:column;gap:8px;padding:12px 14px;border:.5px solid var(--dsw-alias-settings-card-stroke);border-radius:var(--dsw-radius-xl);background:var(--dsw-alias-settings-card-fill)}
 .PF-hint{margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
-.PF-select{box-sizing:border-box;width:100%;height:36px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;outline:none}
-.PF-select:focus-visible{border-color:var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary))}
-.PF-select:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}
 .PF-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .PF-textarea{box-sizing:border-box;width:100%;min-height:180px;padding:10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xs-13);line-height:1.6;resize:vertical;outline:none}
 .PF-textarea:focus-visible{border-color:var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));color:var(--dsw-alias-label-primary)}
 .PF-ghost{height:28px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}
 .PF-ghost:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.PF-picker{min-width:0;position:relative}
+.PF-pickerTrigger{box-sizing:border-box;width:100%;height:36px;padding:0 8px 0 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;text-align:left;cursor:pointer;outline:none;display:flex;align-items:center;gap:6px}
+.PF-pickerTrigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.PF-pickerTrigger:focus-visible{border-color:var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));box-shadow:0 0 0 2px color-mix(in srgb,var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary)) 18%,transparent)}
+.PF-pickerTrigger:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}
+.PF-pickerValue{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.PF-pickerChevron{flex:none;color:var(--dsw-alias-label-caption);transition:transform .12s var(--ds-ease-in-out, ease)}
+.PF-pickerChevron[data-open=true]{transform:rotate(180deg)}
+.PF-menu{z-index:1200;box-sizing:border-box;position:absolute;top:calc(100% + 4px);left:0;right:0;padding:4px;display:flex;flex-direction:column;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg);background:var(--dsw-specific-menu,var(--dsw-alias-bg-layer-3));backdrop-filter:var(--dsw-menu-backdrop-filter,none);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2);box-shadow:var(--dsw-elevation-prominent,var(--dsw-elevation-panel,0 8px 28px rgba(0,0,0,.18)));color:var(--dsw-alias-label-primary);max-height:min(340px,60vh);overflow-y:auto}
+.PF-menuSearch{box-sizing:border-box;flex:none;width:100%;height:32px;margin-bottom:4px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;outline:none}
+.PF-menuSearch::placeholder{color:var(--dsw-alias-label-tertiary)}
+.PF-menuSearch:focus-visible{border-color:var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary))}
+.PF-menuRow{display:flex;flex-direction:column;gap:1px}
+.PF-menuEmpty{padding:8px 10px;color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:20px}
+.PF-option{box-sizing:border-box;display:flex;align-items:center;gap:8px;width:100%;min-height:34px;padding:6px 8px 6px 10px;border:0;border-radius:var(--dsw-radius-md,10px);background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;text-align:left;cursor:pointer}
+.PF-option:hover:not(:disabled),.PF-option[data-active=true]{background:var(--dsw-alias-interactive-bg-hover)}
+.PF-option:focus-visible{outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:-2px}
+.PF-option:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}
+.PF-optionCopy{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.PF-optionCheck{flex:none;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;color:var(--dsw-alias-label-secondary)}
+.PF-menuHint{padding:6px 10px 2px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
 .PF-status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-caption)}
 .PF-status[data-tone=error]{color:var(--dsw-alias-state-error-primary)}
 .PF-status[data-tone=ok]{color:var(--dsw-alias-state-success-primary)}
@@ -482,11 +519,10 @@ function findModel(group, modelId) {
 }
 
 /** Render a selection as `provider / model`. */
-function selectionLabel(catalog, selection) {
+function modelName(catalog, selection) {
   const group = findGroup(catalog, selection.provider);
   const model = findModel(group, selection.model);
-  if (model === undefined) return `${selection.provider} / ${selection.model}`;
-  return `${group?.name ?? selection.provider} / ${model.name ?? model.id}`;
+  return `${group?.name ?? selection.provider} / ${model?.name ?? selection.model}`;
 }
 
 /**
@@ -617,6 +653,192 @@ function PromptForgeButton(props) {
   })));
 }
 
+/** The label one reasoning effort shows in the picker. */
+function effortName(reasoning, effort, t) {
+  if (effort === '') return t('effort.default');
+  const level = reasoning?.efforts?.find((candidate) => candidate.id === effort);
+  return level?.name ?? effort;
+}
+
+/* -------------------------------------------------------------- pickers */
+
+/**
+ * One dropdown in the shipped menu idiom: a bordered value trigger and an
+ * anchored panel of grouped rows.
+ *
+ * The panel is plain markup rather than the shell's floating `Menu`, because a
+ * settings page scrolls and a fixed-position surface would detach from its
+ * trigger. Visual language (row rhythm, hover fill, group headings, check mark)
+ * follows the composer's model menu so the two read as one design.
+ *
+ * The panel's query lives here, so `children(choose, query)` re-renders its
+ * filtered rows on every keystroke instead of filtering against a stale value.
+ */
+function Picker(props) {
+  const { label, ariaLabel, disabled, menuAriaLabel, searchPlaceholder, onSelect, children } = props;
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const root = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event) => {
+      if (root.current !== null && !root.current.contains(event.target)) setOpen(false);
+    };
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [open]);
+
+  const choose = (key) => {
+    setOpen(false);
+    setQuery('');
+    onSelect(key);
+  };
+
+  return ReactRuntime.createElement('div', { className: 'PF-picker', ref: root }, [
+    ReactRuntime.createElement('button', {
+      key: 'trigger',
+      type: 'button',
+      className: 'PF-pickerTrigger',
+      disabled: disabled === true,
+      'aria-label': ariaLabel,
+      'aria-expanded': open,
+      'aria-haspopup': 'listbox',
+      onClick: () => setOpen((current) => !current),
+    }, [
+      ReactRuntime.createElement('span', { key: 'value', className: 'PF-pickerValue' }, label),
+      ReactRuntime.createElement(IconChevronDownOutlineRegular, {
+        key: 'chevron',
+        size: 16,
+        className: 'PF-pickerChevron',
+        'data-open': open ? 'true' : 'false',
+        'aria-hidden': true,
+      }),
+    ]),
+    open ? ReactRuntime.createElement('div', {
+      key: 'menu',
+      className: 'PF-menu scrollable',
+      role: 'listbox',
+      'aria-label': menuAriaLabel ?? ariaLabel,
+    }, [
+      searchPlaceholder === undefined ? null : ReactRuntime.createElement('input', {
+        key: 'search',
+        type: 'search',
+        className: 'PF-menuSearch',
+        value: query,
+        placeholder: searchPlaceholder,
+        spellCheck: false,
+        autoFocus: true,
+        'aria-label': searchPlaceholder,
+        onChange: (event) => setQuery(event.target.value),
+      }),
+      children(choose, query),
+    ]) : null,
+  ]);
+}
+
+/** One selectable row inside a picker panel. */
+function PickerOption(props) {
+  const { optionKey, selected, name, onSelect, disabled, hint } = props;
+  return ReactRuntime.createElement('button', {
+    type: 'button',
+    role: 'option',
+    className: 'PF-option',
+    'data-key': optionKey,
+    'aria-selected': selected === true,
+    disabled: disabled === true,
+    onClick: () => onSelect(),
+  }, [
+    ReactRuntime.createElement('span', { key: 'copy', className: 'PF-optionCopy' }, [
+      ReactRuntime.createElement('span', { key: 'name' }, name),
+      hint === undefined ? null : ReactRuntime.createElement('span', { key: 'hint', className: 'PF-menuHint' }, hint),
+    ]),
+    ReactRuntime.createElement('span', { key: 'check', className: 'PF-optionCheck' }, selected === true
+      ? ReactRuntime.createElement(IconCheckOutlineRegular, { 'aria-hidden': true })
+      : null),
+  ]);
+}
+
+/** The composer's model menu, reused for the optimization model. */
+function ModelPicker(props) {
+  const { catalog, settings, t } = props;
+  const groups = catalog.value?.groups ?? [];
+  const storedModel = settings !== undefined && settings.provider !== '' && settings.model !== ''
+    ? { provider: settings.provider, model: settings.model }
+    : null;
+  const used = effectiveSelection(catalog.value, settings);
+  const currentName = used === null ? t('model.statusEmpty') : modelName(catalog.value, used);
+  const defaultName = catalog.value?.default === undefined
+    ? '—'
+    : modelName(catalog.value, catalog.value.default);
+  const showSearch = groups.reduce((total, group) => total + group.models.length, 0) > 8;
+
+  return ReactRuntime.createElement(Picker, {
+    label: storedModel === null ? t('model.default', { name: defaultName }) : currentName,
+    ariaLabel: t('model.aria', { name: currentName }),
+    menuAriaLabel: t('model.listAria'),
+    searchPlaceholder: showSearch ? t('model.search') : undefined,
+    disabled: groups.length === 0 || settings === undefined,
+    onSelect: (key) => {
+      if (key === '') {
+        settingsStore.patch({ provider: '', model: '', reasoningEffort: '' });
+        return;
+      }
+      const separator = key.indexOf('\u0000');
+      settingsStore.patch({
+        provider: key.slice(0, separator),
+        model: key.slice(separator + 1),
+        reasoningEffort: '',
+      });
+    },
+  }, (choose, query) => {
+    const needle = query.trim().toLowerCase();
+    const matches = (text) => needle === '' || String(text).toLowerCase().includes(needle);
+    const visibleGroups = groups
+      .map((group) => ({
+        group,
+        models: group.models.filter((model) => matches(model.name ?? model.id)
+          || matches(model.id)
+          || matches(group.name ?? group.id)),
+      }))
+      .filter((entry) => entry.models.length > 0);
+    return [
+      ReactRuntime.createElement(MenuGroup, { key: 'default-group', label: t('model.followingGroup') }, [
+        ReactRuntime.createElement('div', { key: 'rows', className: 'PF-menuRow' }, [
+          ReactRuntime.createElement(PickerOption, {
+            key: 'default',
+            optionKey: '',
+            selected: storedModel === null,
+            name: t('model.default', { name: defaultName }),
+            onSelect: () => choose(''),
+          }),
+        ]),
+      ]),
+      ...visibleGroups.map(({ group, models }) => ReactRuntime.createElement(MenuGroup, {
+        key: group.id,
+        label: group.name ?? group.id,
+      }, ReactRuntime.createElement('div', { className: 'PF-menuRow' }, models.map((model) => ReactRuntime.createElement(PickerOption, {
+        key: `${group.id}\u0000${model.id}`,
+        optionKey: `${group.id}\u0000${model.id}`,
+        selected: storedModel !== null && storedModel.provider === group.id && storedModel.model === model.id,
+        name: model.name ?? model.id,
+        hint: model.description,
+        onSelect: () => choose(`${group.id}\u0000${model.id}`),
+      }))))),
+      needle !== '' && visibleGroups.length === 0
+        ? ReactRuntime.createElement('div', { key: 'empty', className: 'PF-menuEmpty' }, t('model.empty'))
+        : null,
+    ];
+  });
+}
+
 /* ------------------------------------------------------------ settings page */
 
 /** One labelled card with an explanatory hint. */
@@ -666,25 +888,8 @@ function PromptForgeSettings(props) {
   const reasoning = used === null
     ? undefined
     : findModel(findGroup(catalog.value, used.provider), used.model)?.reasoning;
-  const storedModel = settings !== undefined && settings.provider !== '' && settings.model !== ''
-    ? { provider: settings.provider, model: settings.model }
-    : null;
   const prompt = promptDraft ?? settings?.systemPrompt ?? '';
   const error = settingsStore.error();
-
-  const chooseModel = (event) => {
-    const raw = event.target.value;
-    if (raw === '') {
-      settingsStore.patch({ provider: '', model: '', reasoningEffort: '' });
-      return;
-    }
-    const separator = raw.indexOf('\u0000');
-    settingsStore.patch({
-      provider: raw.slice(0, separator),
-      model: raw.slice(separator + 1),
-      reasoningEffort: '',
-    });
-  };
 
   return ReactRuntime.createElement('div', { className: 'PF-page' }, [
     ReactRuntime.createElement('p', { key: 'intro', className: 'PF-intro' }, t('intro')),
@@ -700,25 +905,12 @@ function PromptForgeSettings(props) {
       catalog.status === 'error'
         ? ReactRuntime.createElement('p', { key: 'error', className: 'PF-error' }, catalog.error)
         : null,
-      ReactRuntime.createElement('select', {
-        key: 'select',
-        className: 'PF-select',
-        value: storedModel === null ? '' : `${storedModel.provider}\u0000${storedModel.model}`,
-        disabled: groups.length === 0 || settings === undefined,
-        onChange: chooseModel,
-        'aria-label': t('model.heading'),
-      }, [
-        ReactRuntime.createElement('option', { key: 'default', value: '' },
-          t('model.default', {
-            name: catalog.value?.default === undefined
-              ? '—'
-              : selectionLabel(catalog.value, catalog.value.default),
-          })),
-        ...groups.flatMap((group) => group.models.map((model) => ReactRuntime.createElement('option', {
-          key: `${group.id}\u0000${model.id}`,
-          value: `${group.id}\u0000${model.id}`,
-        }, `${group.name ?? group.id} / ${model.name ?? model.id}`))),
-      ]),
+      ReactRuntime.createElement(ModelPicker, {
+        key: 'picker',
+        catalog,
+        settings,
+        t,
+      }),
     ]),
 
     ReactRuntime.createElement(Section, {
@@ -726,20 +918,30 @@ function PromptForgeSettings(props) {
       title: t('effort.heading'),
       hint: reasoning === undefined ? t('effort.unsupported') : t('effort.hint'),
     }, [
-      ReactRuntime.createElement('select', {
-        key: 'select',
-        className: 'PF-select',
-        value: settings?.reasoningEffort ?? '',
+      ReactRuntime.createElement(Picker, {
+        key: 'picker',
+        label: effortName(reasoning, settings?.reasoningEffort ?? '', t),
+        ariaLabel: t('effort.heading'),
+        menuAriaLabel: t('effort.heading'),
         disabled: reasoning === undefined || settings === undefined,
-        onChange: (event) => settingsStore.patch({ reasoningEffort: event.target.value }),
-        'aria-label': t('effort.heading'),
-      }, [
-        ReactRuntime.createElement('option', { key: 'default', value: '' }, t('effort.default')),
-        ...(reasoning?.efforts ?? []).map((level) => ReactRuntime.createElement('option', {
+        onSelect: (key) => settingsStore.patch({ reasoningEffort: key }),
+      }, (choose) => ReactRuntime.createElement('div', { className: 'PF-menuRow' }, [
+        ReactRuntime.createElement(PickerOption, {
+          key: 'default',
+          optionKey: '',
+          selected: (settings?.reasoningEffort ?? '') === '',
+          name: t('effort.default'),
+          onSelect: () => choose(''),
+        }),
+        ...(reasoning?.efforts ?? []).map((level) => ReactRuntime.createElement(PickerOption, {
           key: level.id,
-          value: level.id,
-        }, level.description === undefined ? level.name : `${level.name} — ${level.description}`)),
-      ]),
+          optionKey: level.id,
+          selected: settings?.reasoningEffort === level.id,
+          name: level.name,
+          hint: level.description,
+          onSelect: () => choose(level.id),
+        })),
+      ])),
       ReactRuntime.createElement('p', { key: 'note', className: 'PF-hint' }, t('effort.followUp')),
     ]),
 
