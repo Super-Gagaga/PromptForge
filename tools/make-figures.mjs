@@ -185,13 +185,17 @@ def composer(t):
     d.line([46 * SCALE, row_y + 6 * SCALE, 46 * SCALE, row_y + 14 * SCALE], fill=secondary, width=SCALE)
     d.text((64 * SCALE, row_y + 10 * SCALE), '文件', font=body, fill=secondary, anchor='lm')
 
-    # the plugin control: a rounded hover target with a four-point spark
-    star_x = 686 * SCALE
-    d.rounded_rectangle([star_x, row_y, star_x + 24 * SCALE, row_y + 24 * SCALE], radius=12 * SCALE,
+    # the current text-and-spark control (illustration, not a screenshot)
+    star_x = 664 * SCALE
+    d.rounded_rectangle([star_x, row_y, star_x + 124 * SCALE, row_y + 24 * SCALE], radius=8 * SCALE,
                         fill=blend(hexa(t['interactive-bg-hover']), base))
-    cx, cy, r, waist = star_x + 12 * SCALE, row_y + 12 * SCALE, 7 * SCALE, 2.1 * SCALE
+    for offset, length in ((7, 9), (12, 12), (17, 8)):
+        d.line([star_x + 5 * SCALE, row_y + offset * SCALE,
+                star_x + (5 + length) * SCALE, row_y + offset * SCALE], fill=on, width=2 * SCALE)
+    cx, cy, r, waist = star_x + 21 * SCALE, row_y + 7 * SCALE, 4 * SCALE, 1.2 * SCALE
     d.polygon([(cx, cy - r), (cx + waist, cy - waist), (cx + r, cy), (cx + waist, cy + waist),
                (cx, cy + r), (cx - waist, cy + waist), (cx - r, cy), (cx - waist, cy - waist)], fill=on)
+    d.text((star_x + 32 * SCALE, row_y + 12 * SCALE), '优化提示词', font=small, fill=on, anchor='lm')
     send_x = 806 * SCALE
     d.rounded_rectangle([send_x, row_y, send_x + 30 * SCALE, row_y + 24 * SCALE], radius=8 * SCALE, fill=on)
     d.polygon([(send_x + 10 * SCALE, row_y + 6 * SCALE), (send_x + 22 * SCALE, row_y + 12 * SCALE),
@@ -201,9 +205,9 @@ def composer(t):
     y = 196 * SCALE
     d.text((20 * SCALE, y), '优化结果（蓝色框内是本插件追加的内容）', font=heading, fill=primary)
     y += 28 * SCALE
-    d.text((20 * SCALE, y), '检查 admin 登录页面与后端路由逻辑是否合理。', font=body, fill=primary)
+    d.text((20 * SCALE, y), '根据我的项目经历和目标岗位，整理一份技术简历，保留可核验的事实。', font=body, fill=primary)
     y += 26 * SCALE
-    for title, rows in (('Files this task needs:', ['@web/admin-login.html', '@internal/router/router.go']),
+    for title, rows in (('Files this task needs:', ['@docs/project-experience.md', '@docs/target-role.md']),
                         ('Skills this task may need:', ['/make-resume', '/great-resume'])):
         box_h = (30 + len(rows) * 16) * SCALE
         box, _ = card(((W - 40) * SCALE, box_h), blend(hexa(t['interactive-bg-hover']), base),
@@ -214,7 +218,7 @@ def composer(t):
         for index, row in enumerate(rows):
             d.text((30 * SCALE, y + (28 + index * 16) * SCALE), row, font=mono, fill=secondary)
         y += box_h + 10 * SCALE
-    d.text((20 * SCALE, y + 2 * SCALE), '星形按钮只替换输入框内容，不会发送消息。', font=small, fill=caption)
+    d.text((20 * SCALE, y + 2 * SCALE), '操作示意：优化只替换草稿，不发送；文件与技能名称仅为示例。', font=small, fill=caption)
     return img.crop((0, 0, W * SCALE, y + 26 * SCALE))
 
 def settings(t):
