@@ -24,13 +24,19 @@
     "VERIFICATION.md",
     "build.mjs",
     "src",
-    "tools"
+    "tools",
+    "tests",
+    "TESTING.md"
   ],
   "scripts": {
     "build": "node build.mjs",
     "figures": "node tools/make-figures.mjs",
     "docs": "node tools/check-docs.mjs",
-    "test": "node build.mjs && node tools/selfcheck.mjs && node tools/make-figures.mjs --check && node tools/check-docs.mjs"
+    "test": "node build.mjs && node tools/coverage.mjs && node tools/make-figures.mjs --check && node tools/check-docs.mjs",
+    "test:unit": "node build.mjs && node --test tests/*.test.mjs",
+    "test:integration": "node build.mjs && node tools/selfcheck.mjs",
+    "test:coverage": "node build.mjs && node tools/coverage.mjs",
+    "test:dsh": "node tools/check-dsh.mjs"
   },
   "dsh": {
     "bundle": {

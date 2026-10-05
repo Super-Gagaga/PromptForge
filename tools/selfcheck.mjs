@@ -14,9 +14,10 @@
 import { strict as assert } from 'node:assert';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { createContext, runInContext } from 'node:vm';
+import { createContext, runInContext, runInThisContext } from 'node:vm';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { recordSource } from './coverage-source.mjs';
 
 /* The Host half stores its document under DSH_HOME, so the check runs against
    throwaway homes: it must never read or write the real profile's settings, and
@@ -246,7 +247,10 @@ async function loadClientHalf(react, fetchImpl) {
   shell.load = (registered) => {
     definition = registered;
   };
-  const evaluate = new Function('window', `return (function(){ ${source} })();`);
+  const evaluated = `(function(window){\n${source}\n})`;
+  const evaluate = runInThisContext(evaluated, {
+    filename: recordSource(join(root, 'lib/client.js'), evaluated), lineOffset: -1,
+  });
   evaluate({ __ModuleLoader__: shell });
   assert.equal(definition?.id, 'dsh-prompt-forge', 'the bundle must register under its package name');
   assert.equal(typeof definition.factory, 'function', 'the bundle must register a factory');
@@ -1043,7 +1047,7 @@ for (const scenario of [
       any: (signals) => AbortSignal.any(signals),
     },
   });
-  runInContext(source, sandbox);
+  runInContext(source, sandbox, { filename: recordSource(join(root, 'lib/index.js'), source) });
   const envelopeResults = runInContext(`[
     readRewriteAnswer('Explain this JSON example: {"prompt":"example value"}'),
     readRewriteAnswer('{"prompt":"example value"}', false, false),

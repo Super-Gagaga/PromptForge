@@ -24,3 +24,6 @@ docs/images/.payload.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Generated source coverage reports
+coverage/

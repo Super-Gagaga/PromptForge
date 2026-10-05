@@ -1,0 +1,5 @@
+{
+  "src/shared.js": { "lines": 100, "branches": 95, "functions": 100 },
+  "src/host.js": { "lines": 98, "branches": 80, "functions": 98 },
+  "src/client.js": { "lines": 99, "branches": 80, "functions": 90 }
+}
