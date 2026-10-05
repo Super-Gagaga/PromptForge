@@ -90,12 +90,24 @@ function readStrings(source) {
 const python = process.env.DSH_PYTHON
   ?? 'C:/Users/hzh12/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe';
 
-if (!existsSync(THEME_FILE)) throw new Error(`theme bundle not found at ${THEME_FILE}`);
-if (!existsSync(CONVERSATION_FILE)) throw new Error(`conversation bundle not found at ${CONVERSATION_FILE}`);
-if (!existsSync(python)) throw new Error(`python runtime not found at ${python}; set DSH_PYTHON`);
-
-const tokens = readTokens(await readFile(THEME_FILE, 'utf8'));
-const strings = readStrings(await readFile(CONVERSATION_FILE, 'utf8'));
+/**
+ * Read the installed DSH bundles this generator draws from.
+ *
+ * Those paths only exist after a local DSH extraction, so the reads are deferred
+ * to the generate branch: `--check` inspects the committed PNGs alone and has to
+ * run anywhere, including CI runners with no DSH install.
+ *
+ * @returns `{ tokens, strings }` read from the installed bundles.
+ */
+async function loadInstalledBundles() {
+  if (!existsSync(THEME_FILE)) throw new Error(`theme bundle not found at ${THEME_FILE}`);
+  if (!existsSync(CONVERSATION_FILE)) throw new Error(`conversation bundle not found at ${CONVERSATION_FILE}`);
+  if (!existsSync(python)) throw new Error(`python runtime not found at ${python}; set DSH_PYTHON`);
+  return {
+    tokens: readTokens(await readFile(THEME_FILE, 'utf8')),
+    strings: readStrings(await readFile(CONVERSATION_FILE, 'utf8')),
+  };
+}
 
 /**
  * The Pillow renderer.
@@ -346,6 +358,7 @@ if (process.argv.includes('--check')) {
   if (problems.length > 0) throw new Error(`missing or empty figures: ${problems.join(', ')}; run "node tools/make-figures.mjs"`);
   process.stdout.write(`dsh-prompt-forge: ${FIGURES.length} figures present\n`);
 } else {
+  const { tokens, strings } = await loadInstalledBundles();
   await mkdir(OUT_DIR, { recursive: true });
   const payload = { tokens, strings, out: OUT_DIR.replaceAll('\\', '/') };
   const script = join(OUT_DIR, '.render.py');
