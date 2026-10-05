@@ -14,6 +14,10 @@ prompt-forge.json
 *.log
 npm-debug.log*
 
+# Figure generator scratch files (the PNGs are committed)
+docs/images/.render.py
+docs/images/.payload.json
+
 # Editor and OS noise
 .vscode/
 .idea/

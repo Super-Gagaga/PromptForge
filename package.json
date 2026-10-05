@@ -19,13 +19,18 @@
     "cordis.patch.yml",
     "icon.svg",
     "locale",
+    "docs",
     "README.md",
+    "VERIFICATION.md",
     "build.mjs",
-    "src"
+    "src",
+    "tools"
   ],
   "scripts": {
     "build": "node build.mjs",
-    "test": "node build.mjs && node tools/selfcheck.mjs"
+    "figures": "node tools/make-figures.mjs",
+    "docs": "node tools/check-docs.mjs",
+    "test": "node build.mjs && node tools/selfcheck.mjs && node tools/make-figures.mjs --check && node tools/check-docs.mjs"
   },
   "dsh": {
     "bundle": {
