@@ -197,17 +197,20 @@ def composer(t):
     d.line([46 * SCALE, row_y + 6 * SCALE, 46 * SCALE, row_y + 14 * SCALE], fill=secondary, width=SCALE)
     d.text((64 * SCALE, row_y + 10 * SCALE), '文件', font=body, fill=secondary, anchor='lm')
 
-    # the current text-and-spark control (illustration, not a screenshot)
-    star_x = 664 * SCALE
-    d.rounded_rectangle([star_x, row_y, star_x + 124 * SCALE, row_y + 24 * SCALE], radius=8 * SCALE,
-                        fill=blend(hexa(t['interactive-bg-hover']), base))
-    for offset, length in ((7, 9), (12, 12), (17, 8)):
-        d.line([star_x + 5 * SCALE, row_y + offset * SCALE,
-                star_x + (5 + length) * SCALE, row_y + offset * SCALE], fill=on, width=2 * SCALE)
-    cx, cy, r, waist = star_x + 21 * SCALE, row_y + 7 * SCALE, 4 * SCALE, 1.2 * SCALE
+    # The plugin control as shipped: a 28px icon-only button just left of the
+    # send control. Its title lives in a tooltip, so a labelled pill here would
+    # misrepresent the actual UI.
+    star_x = 726 * SCALE
+    d.ellipse([star_x, row_y - 2 * SCALE, star_x + 28 * SCALE, row_y + 26 * SCALE],
+              fill=blend(hexa(t['interactive-bg-hover']), base))
+    ix = star_x + 6 * SCALE
+    iy = row_y + 3 * SCALE
+    for offset, length in ((0, 8), (5, 11), (10, 7)):
+        d.line([ix, iy + offset * SCALE, ix + length * SCALE, iy + offset * SCALE], fill=on, width=2 * SCALE)
+    cx, cy, r, waist = ix + 11 * SCALE, iy + 2 * SCALE, 4.5 * SCALE, 1.3 * SCALE
     d.polygon([(cx, cy - r), (cx + waist, cy - waist), (cx + r, cy), (cx + waist, cy + waist),
                (cx, cy + r), (cx - waist, cy + waist), (cx - r, cy), (cx - waist, cy - waist)], fill=on)
-    d.text((star_x + 32 * SCALE, row_y + 12 * SCALE), '优化提示词', font=small, fill=on, anchor='lm')
+    d.text((star_x - 8 * SCALE, row_y + 12 * SCALE), '', font=small, fill=caption, anchor='rm')
     send_x = 806 * SCALE
     d.rounded_rectangle([send_x, row_y, send_x + 30 * SCALE, row_y + 24 * SCALE], radius=8 * SCALE, fill=on)
     d.polygon([(send_x + 10 * SCALE, row_y + 6 * SCALE), (send_x + 22 * SCALE, row_y + 12 * SCALE),
@@ -230,7 +233,7 @@ def composer(t):
         for index, row in enumerate(rows):
             d.text((30 * SCALE, y + (28 + index * 16) * SCALE), row, font=mono, fill=secondary)
         y += box_h + 10 * SCALE
-    d.text((20 * SCALE, y + 2 * SCALE), '操作示意：优化只替换草稿，不发送；文件与技能名称仅为示例。', font=small, fill=caption)
+    d.text((20 * SCALE, y + 2 * SCALE), '操作示意：发送控件左侧的星形按钮即「优化提示词」；优化只替换草稿，不发送。', font=small, fill=caption)
     return img.crop((0, 0, W * SCALE, y + 26 * SCALE))
 
 def settings(t):
