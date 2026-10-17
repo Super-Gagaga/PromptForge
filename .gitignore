@@ -18,6 +18,9 @@ npm-debug.log*
 docs/images/.render.py
 docs/images/.payload.json
 
+# Local probe against a running DSH (machine-specific session ids)
+tools/live-probe.mjs
+
 # Editor and OS noise
 .vscode/
 .idea/
@@ -27,3 +30,4 @@ desktop.ini
 
 # Generated source coverage reports
 coverage/
+.openbitfun/

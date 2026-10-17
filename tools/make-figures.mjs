@@ -10,25 +10,27 @@
  *   node tools/make-figures.mjs            # write docs/images/*.png
  *   node tools/make-figures.mjs --check    # fail if a figure is missing
  *
+ * Both the tokens and the strings are read straight out of the installed
+ * `app.asar`, so an upgrade cannot leave this pointing at a stale extraction.
  * Pillow is used through the bundled Python runtime, so no npm dependency is
  * added to the package.
  */
 
 import { execFile } from 'node:child_process';
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, unlink, writeFile } from 'node:fs/promises';
 import { existsSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { openAsar } from './asar.mjs';
 
 const run = promisify(execFile);
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const OUT_DIR = join(root, 'docs', 'images');
 
-/** The installed theme bundle: the one place real token values live. */
-const THEME_FILE = 'C:/Users/hzh12/AppData/Local/Temp/dsh-asar/theme/dsh/node_modules/@deepseek-ai/dsh-client-ui-theme/lib/client.js';
-/** The conversation bundle: the shipped composer strings. */
-const CONVERSATION_FILE = 'C:/Users/hzh12/AppData/Local/Temp/dsh-asar/ext/dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js';
+/** Archive-internal paths of the bundles that own the tokens and the strings. */
+const THEME_FILE = '/dsh/node_modules/@deepseek-ai/dsh-client-ui-theme/lib/client.js';
+const CONVERSATION_FILE = '/dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/lib/client.js';
 
 /**
  * Resolve the alias tokens this generator needs into literal colours.
@@ -87,25 +89,23 @@ function readStrings(source) {
   };
 }
 
+/** The bundled Python that has Pillow; overridable for other installs. */
 const python = process.env.DSH_PYTHON
   ?? 'C:/Users/hzh12/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe';
 
 /**
- * Read the installed DSH bundles this generator draws from.
+ * Read the token map and UI strings out of the installed archive.
  *
- * Those paths only exist after a local DSH extraction, so the reads are deferred
- * to the generate branch: `--check` inspects the committed PNGs alone and has to
- * run anywhere, including CI runners with no DSH install.
+ * These reads only happen when generating: `--check` inspects the committed
+ * PNGs and must run anywhere, including a machine without DSH installed.
  *
- * @returns `{ tokens, strings }` read from the installed bundles.
+ * @returns `{ tokens, strings }` as the running app defines them.
  */
-async function loadInstalledBundles() {
-  if (!existsSync(THEME_FILE)) throw new Error(`theme bundle not found at ${THEME_FILE}`);
-  if (!existsSync(CONVERSATION_FILE)) throw new Error(`conversation bundle not found at ${CONVERSATION_FILE}`);
-  if (!existsSync(python)) throw new Error(`python runtime not found at ${python}; set DSH_PYTHON`);
+function loadInstalledBundles() {
+  const asar = openAsar();
   return {
-    tokens: readTokens(await readFile(THEME_FILE, 'utf8')),
-    strings: readStrings(await readFile(CONVERSATION_FILE, 'utf8')),
+    tokens: readTokens(asar.read(THEME_FILE)),
+    strings: readStrings(asar.read(CONVERSATION_FILE)),
   };
 }
 
@@ -358,7 +358,8 @@ if (process.argv.includes('--check')) {
   if (problems.length > 0) throw new Error(`missing or empty figures: ${problems.join(', ')}; run "node tools/make-figures.mjs"`);
   process.stdout.write(`dsh-prompt-forge: ${FIGURES.length} figures present\n`);
 } else {
-  const { tokens, strings } = await loadInstalledBundles();
+  if (!existsSync(python)) throw new Error(`python runtime not found at ${python}; set DSH_PYTHON`);
+  const { tokens, strings } = loadInstalledBundles();
   await mkdir(OUT_DIR, { recursive: true });
   const payload = { tokens, strings, out: OUT_DIR.replaceAll('\\', '/') };
   const script = join(OUT_DIR, '.render.py');
