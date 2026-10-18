@@ -37,6 +37,32 @@ const CANDIDATE_PATH_BUDGET = 160;
 const CANDIDATE_SKILL_BUDGET = 40;
 
 /**
+ * Most draft images one optimization forwards to the model.
+ *
+ * The deployment enforces its own limits on top of this; the cap here just keeps
+ * a large pasted batch from turning one click into an unbounded upload.
+ */
+const MAX_REQUEST_IMAGES = 4;
+
+/**
+ * Largest single image the browser may send, in base64 characters.
+ *
+ * The Host re-checks against the deployment's own byte limit, so this is only an
+ * early refusal that keeps an oversized body off the route.
+ */
+const MAX_REQUEST_IMAGE_CHARS = 14 * 1024 * 1024;
+
+/**
+ * The route the plugin prefers when the user has not chosen one.
+ *
+ * DeepSeek Flash accepts images, which is what makes the image-aware rewrite
+ * work out of the box. The plugin still verifies the route exists before using
+ * it and falls back to the deployment default when it does not.
+ */
+const PREFERRED_PROVIDER = 'deepseek-account';
+const PREFERRED_MODEL = 'deepseek-flash';
+
+/**
  * Directory names the candidate listing probes.
  *
  * Fallback names for providers that do not expose root directory entries.
@@ -323,6 +349,9 @@ function normalizeState(input) {
     /* The skill tier replaces an earlier on/off boolean: `true` was the tier this
        build calls `balanced`, and `false` was no nominations at all. */
     skillMode: normalizeSkillMode(source.skillMode ?? source.referenceSkills),
+    /* Opt-out, like the other reference features: a document written before this
+       field existed keeps images in the rewrite. */
+    referenceImages: flag(source.referenceImages, true),
   };
 }
 

@@ -36,7 +36,7 @@ export function find(node, predicate) {
 // Test-only private access; production artifacts and exports stay unchanged.
 export async function hostScope(extra = {}) {
   const code = (await read('lib/index.js')).replace(/^import .*;\r?$/gm, '').replace(/^export .*;\r?$/gm, '');
-  const names = ['apply','readState','saveState','readBody','readJsonBody','resolveRoute','finishFailure','accumulateText','callModel','parseWholeObject','readRewriteAnswer','nominateReferences','withSignal','resolveFileReferences','listAvailableSkills','resolveSkillReferences','appendReferences','normalizeState','formatFileMention','formatSkillGesture','normalizeSkillMode','composeSystemPrompt','skillCandidateRule','lostOriginalPaths','nominationMatches'];
+  const names = ['apply','readState','saveState','readBody','readJsonBody','resolveRoute','finishFailure','accumulateText','callModel','textContent','composeUserContent','readRequestImages','parseWholeObject','readRewriteAnswer','nominateReferences','withSignal','resolveFileReferences','listAvailableSkills','resolveSkillReferences','appendReferences','normalizeState','formatFileMention','formatSkillGesture','normalizeSkillMode','composeSystemPrompt','skillCandidateRule','lostOriginalPaths','nominationMatches'];
   const evaluated = code + '\n;({'+names.join(',')+'})';
   return runInNewContext(evaluated, { ...fs, homedir, dirname, join, process, Buffer, AbortSignal, setTimeout, clearTimeout, ...extra }, { filename: recordSource(join(root, 'lib/index.js'), evaluated) });
 }

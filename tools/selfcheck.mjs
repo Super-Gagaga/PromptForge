@@ -269,7 +269,7 @@ async function loadClientHalf(react, fetchImpl) {
 }
 
 /** A recording Cordis client context. */
-function makeClientContext() {
+function makeClientContext(services = {}) {
   const registrations = [];
   const effects = [];
   const slots = {
@@ -305,7 +305,7 @@ function makeClientContext() {
     },
     sessions: { binding: () => undefined },
     remote: { session: { modelCatalog: () => Promise.resolve({ ok: true, value: CATALOG }), selectModel: (selection) => { selections.push(selection); return Promise.resolve({}); } } },
-    get: () => undefined,
+    get: (name) => services[name],
   };
   return { ctx, registrations, effects, dictionaries, selections };
 }
@@ -340,6 +340,7 @@ function makeInput(initialDraft) {
     },
     actions: {
       setPhase: (phase) => { state = { ...state, phase }; },
+      setAttachments: (attachmentIds) => { state = { ...state, attachmentIds }; },
       setDraft: (text) => {
         state = { ...state, draft: text, draftRev: state.draftRev + 1 };
         for (const listener of [...listeners]) listener();
@@ -425,13 +426,17 @@ async function callRoute(route, { method = 'POST', body } = {}) {
 }
 
 /** A fake streaming LLM that assembles into the given text. */
-function makeLlm(text, { emit } = {}) {
+function makeLlm(text, { emit, providers, modalities } = {}) {
   const calls = [];
   return {
     calls,
-    listProviders: () => [{ id: 'deepseek-account', name: 'DeepSeek' }],
+    listProviders: () => (providers ?? ['deepseek-account']).map((id) => ({ id, name: id })),
     listModels: async () => [{ id: 'deepseek-flash', name: 'DeepSeek Flash' }],
-    resolveModelInfo: async () => ({ id: 'deepseek-flash', name: 'DeepSeek Flash' }),
+    resolveModelInfo: async () => ({
+      id: 'deepseek-flash',
+      name: 'DeepSeek Flash',
+      ...(modalities === undefined ? {} : { inputModalities: modalities }),
+    }),
     stream(options) {
       calls.push(options);
       return (async function* chunks() {
@@ -624,7 +629,7 @@ check('Host half exports apply/inject/name', () => {
 /* --- 3. no model anywhere is a clean 400 --------------------------------- */
 {
   await freshHome();
-  const llm = makeLlm('unused');
+  const llm = makeLlm('unused', { providers: [] });
   const { ctx, routes } = makeHostContext({ llm, webServer: {} });
   host.apply(ctx);
   const failed = await callRoute(routes.get('/prompt-forge/optimize'), { body: { text: 'hi' } });
@@ -632,6 +637,33 @@ check('Host half exports apply/inject/name', () => {
     assert.equal(failed.status, 400);
     assert.match(failed.json.error, /no model is configured/);
     assert.equal(llm.calls.length, 0, 'no call may be attempted without a route');
+  });
+}
+
+/* --- 3b. the preferred default is DeepSeek Flash -------------------------- */
+{
+  await freshHome();
+  const llm = makeLlm('Rewritten.', { providers: ['deepseek-account', 'xiaomi'] });
+  const { ctx, routes } = makeHostContext({
+    llm,
+    webServer: {},
+    agentDefaultModel: { currentSelection: () => ({ provider: 'xiaomi', model: 'mimo-v2.6-pro' }) },
+  });
+  host.apply(ctx);
+  const result = await callRoute(routes.get('/prompt-forge/optimize'), { body: { text: 'hi' } });
+  check('an unset selection prefers DeepSeek Flash over the deployment default', () => {
+    assert.equal(result.status, 200);
+    assert.equal(llm.calls.length, 1);
+    assert.equal(llm.calls[0].provider, 'deepseek-account');
+    assert.equal(llm.calls[0].model, 'deepseek-flash');
+  });
+
+  await callRoute(routes.get('/prompt-forge/state'), { body: { provider: 'xiaomi', model: 'mimo-v2.6-pro' } });
+  llm.calls.length = 0;
+  await callRoute(routes.get('/prompt-forge/optimize'), { body: { text: 'hi' } });
+  check('an explicit selection still wins over the preferred default', () => {
+    assert.equal(llm.calls[0].provider, 'xiaomi');
+    assert.equal(llm.calls[0].model, 'mimo-v2.6-pro');
   });
 }
 
@@ -1329,6 +1361,117 @@ for (const scenario of [
   });
 }
 
+/* --- 8g. attached images reach the rewrite as context ------------------- */
+{
+  /** A minimal attachment store: it admits images and hands back a durable ref. */
+  const makeAttachments = () => {
+    const batches = [];
+    return {
+      batches,
+      async admitPromptContent(parts) {
+        const images = parts.filter((part) => part.type === 'image');
+        batches.push(images);
+        return parts.map((part) => (part.type === 'image'
+          ? { type: 'image', attachment: { attachment: `ref-${images.indexOf(part)}`, mediaType: part.mediaType } }
+          : { type: 'text', text: part.text }));
+      },
+    };
+  };
+  const png = { mediaType: 'image/png', data: 'aGVsbG8=' };
+
+  await freshHome();
+  const llm = makeLlm('Rewritten.');
+  const attachments = makeAttachments();
+  const { ctx, routes } = makeHostContext({ llm, webServer: {}, attachments });
+  host.apply(ctx);
+  const ok = await callRoute(routes.get('/prompt-forge/optimize'), {
+    body: { text: 'match this screenshot', images: [png] },
+  });
+  check('an attached image is admitted and sent ahead of the text', () => {
+    assert.equal(ok.status, 200, `unexpected body: ${ok.body}`);
+    assert.equal(llm.calls.length, 1);
+    const content = llm.calls[0].messages[0].content;
+    assert.equal(content[0].type, 'image', 'the image must lead the user turn');
+    assert.notEqual(content[0].attachment, undefined, 'the provider adapter reads the admitted ref');
+    assert.equal(content.at(-1).type, 'text');
+    assert.match(content.at(-1).text, /match this screenshot/);
+    assert.equal(attachments.batches[0].length, 1);
+    assert.equal((ok.json.notes ?? []).some((note) => /image/u.test(note)), false,
+      'an accepted image must not produce a warning');
+  });
+
+  /* A text-only model must be told apart from a failure. */
+  await freshHome();
+  const blindLlm = makeLlm('Rewritten.', { modalities: ['text'] });
+  const blindStore = makeAttachments();
+  const blind = makeHostContext({ llm: blindLlm, webServer: {}, attachments: blindStore });
+  host.apply(blind.ctx);
+  const blindResult = await callRoute(blind.routes.get('/prompt-forge/optimize'), {
+    body: { text: 'match this screenshot', images: [png] },
+  });
+  check('a text-only model accepts the rewrite and explains the dropped image', () => {
+    assert.equal(blindResult.status, 200, `unexpected body: ${blindResult.body}`);
+    const content = blindLlm.calls[0].messages[0].content;
+    assert.equal(content.every((block) => block.type === 'text'), true, 'no image block may reach a text model');
+    assert.equal(blindStore.batches.length, 0, 'nothing should be admitted for a blind model');
+    assert.match(String(blindResult.json.notes), /does not accept images/);
+  });
+
+  /* The settings switch must be honoured, not just displayed. */
+  await freshHome();
+  const offLlm = makeLlm('Rewritten.');
+  const offStore = makeAttachments();
+  const off = makeHostContext({ llm: offLlm, webServer: {}, attachments: offStore });
+  host.apply(off.ctx);
+  await callRoute(off.routes.get('/prompt-forge/state'), { body: { referenceImages: false } });
+  const offResult = await callRoute(off.routes.get('/prompt-forge/optimize'), {
+    body: { text: 'match this screenshot', images: [png] },
+  });
+  check('turning image awareness off keeps the image away from the model', () => {
+    assert.equal(offResult.status, 200, `unexpected body: ${offResult.body}`);
+    assert.equal(offStore.batches.length, 0);
+    assert.match(String(offResult.json.notes), /image awareness is disabled/);
+  });
+
+  /* No attachment store in the composition: degrade, never fail. */
+  await freshHome();
+  const bareLlm = makeLlm('Rewritten.');
+  const bare = makeHostContext({ llm: bareLlm, webServer: {} });
+  host.apply(bare.ctx);
+  const bareResult = await callRoute(bare.routes.get('/prompt-forge/optimize'), {
+    body: { text: 'match this screenshot', images: [png] },
+  });
+  check('a composition without an attachment store still rewrites the text', () => {
+    assert.equal(bareResult.status, 200, `unexpected body: ${bareResult.body}`);
+    assert.equal(bareResult.json.prompt, 'Rewritten.');
+    assert.match(String(bareResult.json.notes), /no attachment store/);
+  });
+
+  /* A public route must refuse a malformed batch outright. */
+  await freshHome();
+  const guardLlm = makeLlm('Rewritten.');
+  const guard = makeHostContext({ llm: guardLlm, webServer: {}, attachments: makeAttachments() });
+  host.apply(guard.ctx);
+  const badMedia = await callRoute(guard.routes.get('/prompt-forge/optimize'), {
+    body: { text: 'x', images: [{ mediaType: 'application/pdf', data: 'aGVsbG8=' }] },
+  });
+  const tooMany = await callRoute(guard.routes.get('/prompt-forge/optimize'), {
+    body: { text: 'x', images: Array.from({ length: 5 }, () => png) },
+  });
+  const noData = await callRoute(guard.routes.get('/prompt-forge/optimize'), {
+    body: { text: 'x', images: [{ mediaType: 'image/png' }] },
+  });
+  check('the optimize route refuses a malformed image batch', () => {
+    assert.equal(badMedia.status, 400);
+    assert.match(badMedia.json.error, /mediaType/);
+    assert.equal(tooMany.status, 400);
+    assert.match(tooMany.json.error, /at most 4 images/);
+    assert.equal(noData.status, 400);
+    assert.match(noData.json.error, /base64/);
+    assert.equal(guardLlm.calls.length, 0, 'a refused batch must not reach the model');
+  });
+}
+
 /* --- 9. the browser half loads and registers its two seats --------------- */
 for (const [label, chunks] of [
   ['empty output', [{ type: 'finish', reason: { kind: 'stop' } }]],
@@ -1499,7 +1642,45 @@ const renderButton = (input, sessionId = 'session-1') => {
   });
 }
 
-/* --- 8. clicking it posts the draft, then replaces it without sending --- */
+/* --- 8b. attached images travel with the request, drafts do not ---------- */
+{
+  const imageRun = makeClientContext({
+    conversation: {
+      serializeDraftAttachments: async (ids) => ({
+        attachments: ids.map((id) => (id === 'img-1'
+          ? { type: 'image', mediaType: 'image/png', data: 'aGVsbG8=', name: 'login.png' }
+          : { type: 'file', receiptId: 'receipt-1' })),
+      }),
+    },
+  });
+  client.apply(imageRun.ctx);
+  const imageButton = imageRun.registrations.find((entry) => entry.options.name === 'conversation.input.right');
+  const input = makeInput('look at this screenshot');
+  input.actions.setAttachments(['img-1', 'file-1']);
+  answers = [{ status: 200, body: { prompt: 'OPTIMIZED', files: [], skills: [] } }];
+  fetches.length = 0;
+  react.reset();
+  const props = {
+    ...imageButton.options.inject('session-1'),
+    t: imageRun.ctx.locale.bind('dsh-prompt-forge'),
+    useInput: (selector) => selector(input.store.getSnapshot()),
+    inputActions: input.actions,
+  };
+  const tree = imageButton.component(props);
+  const rendered = find(tree, (node) => node.type === 'button');
+  rendered.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  check('attached images are forwarded as context, and files are left to the send', () => {
+    const call = fetches.find((entry) => entry.url.endsWith('/optimize'));
+    assert.notEqual(call, undefined, 'the click must reach the optimize route');
+    const body = JSON.parse(call.init.body);
+    assert.deepEqual(body.images, [{ mediaType: 'image/png', data: 'aGVsbG8=', name: 'login.png' }],
+      'only the image travels; a file attachment is the send\'s business');
+    assert.equal(body.text, 'look at this screenshot');
+  });
+}
+
+
 {
   const input = makeInput('fix the login bug');
   answers = [{
@@ -1746,10 +1927,12 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
   const skillPicker = () => find(remount(), (node) => node.type === 'button'
     && node.props['aria-haspopup'] === 'listbox'
     && node.props['aria-label'] === 'reference.skills');
+  const imageSwitch = () => switchesOf(remount()).find((node) => node.props['aria-label'] === 'images.toggle');
   const switches = switchesOf(remount());
-  check('the settings page offers a reference-file switch and a skill tier dropdown', () => {
-    assert.deepEqual(switches.map((node) => node.props['aria-label']), ['reference.files']);
-    assert.equal(switches[0].props['aria-checked'], true, 'file references default to on');
+  check('the settings page offers file, image and skill reference controls', () => {
+    assert.deepEqual(switches.map((node) => node.props['aria-label']), ['reference.files', 'images.toggle']);
+    assert.deepEqual(switches.map((node) => node.props['aria-checked']), [true, true],
+      'file and image awareness default to on');
     assert.notEqual(skillPicker(), null, 'the skill tier control must render');
   });
 
@@ -1778,6 +1961,19 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
     const picker = skillPicker();
     const label = find(picker, (node) => node.props?.className === 'PF-pickerValue');
     assert.equal(String(label.props.children), 'reference.skillMode.strict');
+  });
+
+  /* The image switch is its own preference and must persist independently. */
+  const imageToggle = imageSwitch();
+  assert.notEqual(imageToggle, undefined, 'the image switch must render');
+  assert.equal(imageToggle.props['aria-checked'], true, 'image awareness defaults to on');
+  imageToggle.props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  check('turning image awareness off persists it on its own', () => {
+    const write = fetches.filter((entry) => entry.url === '/prompt-forge/state' && entry.init?.method === 'POST').at(-1);
+    const body = JSON.parse(write.init.body);
+    assert.equal(body.referenceImages, false);
+    assert.equal(body.skillMode, 'strict', 'the skill tier must keep its value');
   });
 }
 

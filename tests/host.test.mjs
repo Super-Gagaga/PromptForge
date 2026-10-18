@@ -21,10 +21,65 @@ test('stream assembler orders text blocks and ignores reasoning', () => {
 test('LLM stream contract includes isolated purpose, messages, token cap and signal', async () => {
   let options;
   const llm = { async *stream(opts) { options = opts; yield { type: 'text-delta', index: 0, text: 'answer' }; yield { type: 'finish', reason: { kind: 'stop' } }; } };
-  assert.equal(await h.callModel(llm, { provider: 'p', model: 'm', reasoningEffort: 'high' }, 'system', 'draft'), 'answer');
+  assert.equal(await h.callModel(llm, { provider: 'p', model: 'm', reasoningEffort: 'high' }, 'system', h.textContent('draft')), 'answer');
   assert.equal(options.purpose, 'prompt-forge'); assert.equal(options.maxTokens, 4096); assert.equal(options.reasoningEffort, 'high');
   assert.deepEqual(plain(options.messages), [{ role: 'user', content: [{ type: 'text', text: 'draft' }] }]); assert.ok(options.signal instanceof AbortSignal);
-  await assert.rejects(h.callModel({ async *stream() { throw Error('network changed'); } }, {}, '', ''), /network changed/);
+  await assert.rejects(h.callModel({ async *stream() { throw Error('network changed'); } }, {}, '', h.textContent('')), /network changed/);
+});
+
+test('image composition admits images only for a vision model', async () => {
+  const png = { mediaType: 'image/png', data: 'aGVsbG8=' };
+  const store = { async admitPromptContent(parts) { return parts.map((part) => (part.type === 'image' ? { type: 'image', attachment: { attachmentId: 'a1' } } : part)); } };
+  const hostCtx = { get: (name) => (name === 'attachments' ? store : undefined) };
+  const vision = { async resolveModelInfo() { return { inputModalities: ['text', 'image'] }; } };
+  const notes = [];
+  const content = await h.composeUserContent(hostCtx, vision, { provider: 'p', model: 'm' }, [png], notes, 'text');
+  assert.equal(content[0].type, 'image');
+  assert.equal(content.at(-1).type, 'text');
+  assert.deepEqual(plain(notes), []);
+
+  const blind = { async resolveModelInfo() { return { inputModalities: ['text'] }; } };
+  const blindNotes = [];
+  const blindContent = await h.composeUserContent(hostCtx, blind, { provider: 'p', model: 'm' }, [png], blindNotes, 'text');
+  assert.deepEqual(plain(blindContent), [{ type: 'text', text: 'text' }]);
+  assert.match(blindNotes.join(' '), /does not accept images/);
+
+  const noStore = await h.composeUserContent({ get: () => undefined }, vision, { provider: 'p', model: 'm' }, [png], [], 'text');
+  assert.deepEqual(plain(noStore), [{ type: 'text', text: 'text' }]);
+});
+
+test('image composition degrades on every refusal instead of failing', async () => {
+  const png = { mediaType: 'image/png', data: 'aGVsbG8=' };
+  const admitting = { async admitPromptContent(parts) { return parts.map((part) => (part.type === 'image' ? { type: 'image', attachment: { attachmentId: 'a1' } } : part)); } };
+  const vision = { async resolveModelInfo() { return { inputModalities: ['text', 'image'] }; } };
+
+  /* More images than the per-request cap: keep the first four and say so. */
+  const cappedNotes = [];
+  const capped = await h.composeUserContent({ get: () => admitting }, vision, { provider: 'p', model: 'm' }, Array(6).fill(png), cappedNotes, 'text');
+  assert.equal(capped.filter((part) => part.type === 'image').length, 4);
+  assert.match(cappedNotes.join(' '), /only the first 4 image/);
+
+  /* An unknown model is still attempted; the admission call is the real gate. */
+  const unknown = { async resolveModelInfo() { throw Error('catalog unavailable'); } };
+  const attempted = await h.composeUserContent({ get: () => admitting }, unknown, { provider: 'p', model: 'm' }, [png], [], 'text');
+  assert.equal(attempted[0].type, 'image');
+
+  /* A store that refuses the batch drops the images, never the rewrite. */
+  const refusing = { async admitPromptContent() { throw Error('batch refused'); } };
+  const refusedNotes = [];
+  const refused = await h.composeUserContent({ get: () => refusing }, vision, { provider: 'p', model: 'm' }, [png], refusedNotes, 'text');
+  assert.deepEqual(plain(refused), [{ type: 'text', text: 'text' }]);
+  assert.match(refusedNotes.join(' '), /could not see the images: batch refused/);
+});
+
+test('the request image batch is validated before it reaches the model', () => {
+  assert.deepEqual(plain(h.readRequestImages(undefined)), []);
+  assert.equal(h.readRequestImages([{ mediaType: 'image/png', data: 'aGVsbG8=' }]).length, 1);
+  assert.throws(() => h.readRequestImages('nope'), /array/);
+  assert.throws(() => h.readRequestImages(Array(5).fill({ mediaType: 'image/png', data: 'aGVsbG8=' })), /at most 4/);
+  assert.throws(() => h.readRequestImages([{ mediaType: 'text/plain', data: 'aGVsbG8=' }]), /mediaType/);
+  assert.throws(() => h.readRequestImages([{ mediaType: 'image/png' }]), /base64/);
+  assert.throws(() => h.readRequestImages([{ mediaType: 'image/png', data: 'x'.repeat(14 * 1024 * 1024 + 1) }]), /character limit/);
 });
 test('route selection contract covers missing default and removed provider', () => {
   const llm = { listProviders: () => [{ id: 'p' }] }, state = h.normalizeState({ provider: 'p', model: 'm', reasoningEffort: 'high' });

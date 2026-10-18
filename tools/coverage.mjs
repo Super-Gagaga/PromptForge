@@ -68,7 +68,7 @@ try {
   }
   const percent = map => map.size === 0 ? 0 : [...map.values()].filter(Boolean).length/map.size*100;
   const report = { files: {}, totals: {} };
-  for (const name of names) report.files['src/'+name+'.js'] = { lines: +percent(lines[name]).toFixed(2), branches: +percent(branches[name]).toFixed(2), functions: +percent(funcs[name]).toFixed(2), measuredLines: lines[name].size, uncoveredLines: [...lines[name]].filter(([,hit])=>!hit).map(([line])=>line).sort((a,b)=>a-b) };
+  for (const name of names) report.files['src/'+name+'.js'] = { lines: +percent(lines[name]).toFixed(2), branches: +percent(branches[name]).toFixed(2), functions: +percent(funcs[name]).toFixed(2), measuredLines: lines[name].size, uncoveredLines: [...lines[name]].filter(([,hit])=>!hit).map(([line])=>line).sort((a,b)=>a-b), uncoveredFunctions: [...funcs[name]].filter(([,hit])=>!hit).map(([key])=>key).sort() };
   for (const [key,maps] of Object.entries({ lines, branches, functions: funcs })) { const all = new Map(names.flatMap(n=>[...maps[n]].map(([k,v])=>[n+':'+k,v]))); report.totals[key] = +percent(all).toFixed(2); }
   await mkdir(join(root,'coverage'),{recursive:true}); await writeFile(join(root,'coverage','summary.json'),JSON.stringify(report,null,2)+'\n');
   console.table(report.files); console.log('Source coverage:',report.totals);

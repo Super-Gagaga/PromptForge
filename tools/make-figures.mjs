@@ -337,6 +337,10 @@ def settings(t):
         ('select', '引用技能', '均衡'),
         ('hint', '只引用确实有帮助的技能，最多 3 个；命中的以 /名称 形式列出。', ''),
     ], 168, accent=True)
+    section('图片', [
+        ('switch', '让优化参考图片', '开'),
+        ('hint', '附带的图片会随改写请求发送；图片仍随消息带出，不会被写进提示词。', ''),
+    ], 96)
     section('优化指令', [
         ('hint', '发送给模型的系统提示词，决定重写风格。', ''),
         ('preview', 'You are PromptForge, a prompt-engineering assistant.\n\nRules:\n- Preserve the author intent, language and every concrete detail…', ''),
