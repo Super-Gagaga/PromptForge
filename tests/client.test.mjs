@@ -74,7 +74,34 @@ test('model selection helpers and search cover removed/default/unavailable model
   assert.ok(picker.props.searchPlaceholder);
   assert.ok(find(picker.props.children(()=>{},'no match'),n=>n.props?.className==='PF-menuEmpty'));
   assert.ok(find(picker.props.children(()=>{},'Model 3'),n=>n.props?.name==='Model 3'));
-  picker.props.onSelect(''); await tick(); assert.equal(c.settingsStore.get().value.provider,'');
+
+  /* The follow-default row is gone; the plugin's preferred model is the one
+     marked current before the user has chosen anything. */
+  const preferred = { default:{provider:'fallback',model:'x'}, groups:[
+    { id:'deepseek-account', name:'DeepSeek', models:[{id:'deepseek-flash',name:'Flash'}] },
+    { id:'fallback', name:'Fallback', models:[{id:'x',name:'X'}] },
+  ] };
+  const prefPicker = c.ModelPicker({catalog:{value:preferred},settings:{provider:'',model:''},t});
+  const prefRows = prefPicker.props.children(()=>{},'');
+  const collect = (nodes) => {
+    const out = [];
+    const walk = (node) => {
+      if (node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      if (node.type === c.PickerOption) out.push(node);
+      if (node.props?.children !== undefined) walk(node.props.children);
+    };
+    walk(nodes);
+    return out;
+  };
+  const prefOptions = collect(prefRows);
+  assert.equal(prefOptions.some((option) => option.props.optionKey === ''), false, 'no follow-default row may remain');
+  const current = prefOptions.find((option) => option.props.optionKey === 'deepseek-account\u0000deepseek-flash');
+  assert.equal(current.props.selected, true, 'DeepSeek Flash must open as the current model');
+  assert.deepEqual(plain(c.effectiveSelection(preferred,{provider:'',model:''})),{provider:'deepseek-account',model:'deepseek-flash'});
+
+  picker.props.onSelect('p\u0000m'); await tick(); assert.equal(c.settingsStore.get().value.provider,'p');
+  assert.equal(c.settingsStore.get().value.model,'m');
 });
 test('settings controls persist custom instruction/reset, file switch and effort independently', async () => {
   const saved = [], dom = documentFixture();

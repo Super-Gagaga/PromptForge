@@ -292,9 +292,7 @@ function makeClientContext(services = {}) {
     },
     locale: {
       bind: (ns) => (key, params) => {
-        const template = ns === 'dsh-prompt-forge' && key === 'model.default'
-          ? 'Follow the default model ({name})'
-          : key;
+        const template = key;
         if (params === undefined) return template;
         return template.replace(/\{(\w+)\}/g, (match, name) => (name in params ? String(params[name]) : match));
       },
@@ -313,16 +311,27 @@ function makeClientContext(services = {}) {
 /** The catalog shape the Host Remote returns. */
 const CATALOG = {
   default: { provider: 'deepseek-account', model: 'deepseek-flash', reasoningEffort: 'max' },
-  routableProviders: ['deepseek-account'],
-  groups: [{
-    id: 'deepseek-account',
-    name: 'DeepSeek',
-    models: [{
-      id: 'deepseek-flash',
-      name: 'DeepSeek Flash',
-      reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'max', name: 'Max' }], defaultEffort: 'max' },
-    }],
-  }],
+  routableProviders: ['deepseek-account', 'xiaomi'],
+  groups: [
+    {
+      id: 'deepseek-account',
+      name: 'DeepSeek',
+      models: [{
+        id: 'deepseek-flash',
+        name: 'DeepSeek Flash',
+        reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'max', name: 'Max' }], defaultEffort: 'max' },
+      }],
+    },
+    {
+      id: 'xiaomi',
+      name: 'Xiaomi',
+      models: [{
+        id: 'mimo-v2.6-flash',
+        name: 'MiMo-V2.6-Flash',
+        reasoning: { efforts: [{ id: 'medium', name: 'Medium' }], defaultEffort: 'medium' },
+      }],
+    },
+  ],
   failures: [],
 };
 
@@ -1852,7 +1861,7 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
     assert.equal(modelTrigger.props['aria-expanded'], false, 'the panel starts closed');
   });
 
-  check('the model trigger names the deployment default while following it', () => {
+  check('the model trigger names the plugin default before anything is chosen', () => {
     const label = find(modelTrigger, (node) => node.props?.className === 'PF-pickerValue');
     assert.match(String(label.props.children), /DeepSeek \/ DeepSeek Flash/);
   });
@@ -1862,20 +1871,22 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
   const opened = remount();
   const options = optionsOf(opened);
 
-  check('the open model panel groups the follow-default row apart from the providers', () => {
+  check('the open model panel lists providers only, with no follow-default row', () => {
     assert.equal(triggerFor(opened, 'model.aria').props['aria-expanded'], true, 'the panel opened');
-    assert.deepEqual(groupLabelsOf(opened), ['model.followingGroup', 'DeepSeek']);
-    assert.deepEqual(options.map(optionKey), ['', 'deepseek-account\u0000deepseek-flash'],
-      'the panel must list the follow-default row plus every catalog model');
+    assert.deepEqual(groupLabelsOf(opened), ['DeepSeek', 'Xiaomi'],
+      'every group is a real provider; there is no synthetic default group');
+    assert.deepEqual(options.map(optionKey),
+      ['deepseek-account\u0000deepseek-flash', 'xiaomi\u0000mimo-v2.6-flash'],
+      'the panel must list exactly the catalog models');
+    assert.equal(options.some((option) => optionKey(option) === ''), false,
+      'the follow-default option must be gone');
   });
 
-  check('the panel marks the follow-default row as current, and only that row', () => {
-    if (options.filter((option) => option.props['aria-selected'] === true).length !== 1) {
-      process.stderr.write(`DEBUG rows=${JSON.stringify(options.map((o) => [o.props['data-key'], o.props['aria-selected']]))}\n`);
-    }
+  check('the panel marks the DeepSeek Account model as current, and only that row', () => {
     const selected = options.filter((option) => option.props['aria-selected'] === true);
     assert.equal(selected.length, 1, 'exactly one row may be current');
-    assert.equal(optionKey(selected[0]), '');
+    assert.equal(optionKey(selected[0]), 'deepseek-account\u0000deepseek-flash',
+      'opening the page must already select DeepSeek Account / DeepSeek-V4.1-Flash');
   });
 
   check('the panel paints the shipped check mark on the current row', () => {
@@ -1885,22 +1896,23 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
     assert.equal(glyph.type.__iconName, 'check');
   });
 
-  /* Picking a concrete model clears the stale effort and names itself. */
-  const concrete = options.find((option) => optionKey(option) !== '');
+  /* Picking another provider's model clears the stale effort and names itself. */
+  const concrete = options.find((option) => optionKey(option) === 'xiaomi\u0000mimo-v2.6-flash');
+  assert.notEqual(concrete, undefined, 'the catalog must offer a second provider');
   concrete.props.onClick();
   await new Promise((resolve) => setTimeout(resolve, 5));
   check('choosing a model writes the pair and clears the previous effort', () => {
     const write = fetches.filter((entry) => entry.url === '/prompt-forge/state' && entry.init?.method === 'POST').at(-1);
     assert.notEqual(write, undefined, 'the choice must persist');
     const body = JSON.parse(write.init.body);
-    assert.equal(body.provider, 'deepseek-account');
-    assert.equal(body.model, 'deepseek-flash');
+    assert.equal(body.provider, 'xiaomi');
+    assert.equal(body.model, 'mimo-v2.6-flash');
     assert.equal(body.reasoningEffort, '');
   });
 
-  check('the trigger now names the chosen model instead of the default', () => {
+  check('the trigger now names the chosen model', () => {
     const label = find(triggerFor(remount(), 'model.aria'), (node) => node.props?.className === 'PF-pickerValue');
-    assert.equal(String(label.props.children), 'DeepSeek / DeepSeek Flash');
+    assert.equal(String(label.props.children), 'Xiaomi / MiMo-V2.6-Flash');
   });
 
   check('the effort dropdown offers the live levels of the selected model', () => {
@@ -1908,8 +1920,8 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
     assert.equal(picker.props.disabled, false, 'the selected model exposes effort levels');
     picker.props.onClick();
     const effortOptions = optionsOf(remount());
-    assert.deepEqual(effortOptions.map(optionKey), ['', 'low', 'max'],
-      'the effort rows must come from the catalog of the selected model');
+    assert.deepEqual(effortOptions.map(optionKey), ['', 'medium'],
+      'the effort rows must come from the catalog of the newly selected model');
   });
 
   /* The reference controls: a file switch plus a skill tier dropdown. The page
@@ -1979,8 +1991,6 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
 
 /* Settings writes must settle in order and failures must be visible. */
 {
-  const previousFetch = globalThis.fetch;
-  const requests = [];
   const props = { t: clientRun.ctx.locale.bind('dsh-prompt-forge') };
   const mountSettings = () => {
     react.reset();
@@ -1992,6 +2002,15 @@ for (const scenario of ['edit', 'edit-back', 'submitting', 'unmount']) {
   const row = (tree, key) => find(tree, (node) => node.type === 'button'
     && node.props.role === 'option'
     && node.props['data-key'] === key);
+
+  /* An earlier block selected another provider. Return to the plugin default
+     first, so the effort rows below belong to a model that has two levels. */
+  trigger(mountSettings(), 'model.aria').props.onClick();
+  row(react.rerender(), 'deepseek-account\u0000deepseek-flash').props.onClick();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  const previousFetch = globalThis.fetch;
+  const requests = [];
   globalThis.fetch = (url, init) => {
     if (url !== '/prompt-forge/state' || init?.method !== 'POST') return previousFetch(url, init);
     return new Promise((resolve) => requests.push({ body: JSON.parse(init.body), resolve }));

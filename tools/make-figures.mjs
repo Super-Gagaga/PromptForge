@@ -286,7 +286,7 @@ def settings(t):
             d2.text((x + 14 * SCALE, ry + 10 * SCALE), text, font=label,
                     fill=blend(hexa(t['label-primary']), (255, 255, 255)), anchor='lm')
             if kind == 'select':
-                bw, bh = 250 * SCALE, 32 * SCALE
+                bw, bh = 330 * SCALE, 32 * SCALE
                 bx = x + w - bw - 14 * SCALE
                 by = ry - 4 * SCALE
                 d2.rounded_rectangle([bx, by, bx + bw, by + bh], radius=8 * SCALE,
@@ -329,7 +329,7 @@ def settings(t):
             ry += 36 * SCALE
         y += (height + 12) * SCALE
 
-    section('模型', [('hint', '使用 DSH 已配置的模型；此处列出的就是当前可路由的全部模型。', ''), ('select', '', 'DeepSeek / DeepSeek-V41-Flash')], 96)
+    section('模型', [('hint', '使用 DSH 已配置的模型；此处列出的就是当前可路由的全部模型。', ''), ('select', '', 'DeepSeek Account / DeepSeek-V4.1-Flash')], 96)
     section('思考强度', [('hint', '选“默认”时由模型自己决定强度。', ''), ('select', '', '默认')], 96)
     section('自动引用', [
         ('switch', '引用文件', '开'),

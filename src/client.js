@@ -89,8 +89,6 @@ const zh = {
   'intro': '在输入框旁点击优化按钮，当前草稿就会被重写成更清晰的提示词。优化结果只替换输入框内容，不会自动发送。',
   'model.heading': '模型',
   'model.hint': '使用 DSH 已配置的模型；此处列出的就是当前可路由的全部模型。',
-  'model.default': '跟随默认模型（{name}）',
-  'model.followingGroup': '默认',
   'model.search': '搜索模型…',
   'model.empty': '没有匹配的模型。',
   'model.aria': '选择模型，当前 {name}',
@@ -157,8 +155,6 @@ const en = {
   'intro': 'Click the text-and-spark button beside the composer and the current draft is rewritten into a clearer prompt. The result only replaces the composer text — it is never sent for you.',
   'model.heading': 'Model',
   'model.hint': 'Uses the models DSH already has configured; this list is exactly what can be routed right now.',
-  'model.default': 'Follow the default model ({name})',
-  'model.followingGroup': 'Default',
   'model.search': 'Search models…',
   'model.empty': 'No matching model.',
   'model.aria': 'Select model, current {name}',
@@ -535,18 +531,25 @@ function modelName(catalog, selection) {
 }
 
 /**
- * Read the selection whose effort levels the settings page offers.
+ * Read the selection the settings page shows and offers effort levels for.
  *
- * A stored selection that is no longer routable falls back to the deployment
- * default, so setting the effort never writes a model the Host cannot run.
+ * This must mirror the Host's own priority (`resolveRoute`), or the page would
+ * name one model while the rewrite silently used another. Order: the stored
+ * pair when that model still exists, then the plugin's preferred
+ * vision-capable model, then the deployment default.
+ *
+ * @param catalog - the live model catalog, or null while it loads.
+ * @param settings - the stored settings document, or undefined while it loads.
+ * @returns the effective `{ provider, model }`, or null when nothing is known.
  */
 function effectiveSelection(catalog, settings) {
   if (settings === undefined || catalog === null) return null;
-  const stored = settings.provider !== '' && settings.model !== ''
-    ? { provider: settings.provider, model: settings.model }
-    : null;
-  if (stored !== null && findModel(findGroup(catalog, stored.provider), stored.model) !== undefined) {
-    return stored;
+  if (settings.provider !== '' && settings.model !== '') {
+    const stored = { provider: settings.provider, model: settings.model };
+    if (findModel(findGroup(catalog, stored.provider), stored.model) !== undefined) return stored;
+  }
+  if (findModel(findGroup(catalog, PREFERRED_PROVIDER), PREFERRED_MODEL) !== undefined) {
+    return { provider: PREFERRED_PROVIDER, model: PREFERRED_MODEL };
   }
   const fallback = catalog.default;
   if (fallback?.provider === undefined || fallback?.model === undefined) return null;
@@ -874,28 +877,22 @@ function PickerOption(props) {
 function ModelPicker(props) {
   const { catalog, settings, t } = props;
   const groups = catalog.value?.groups ?? [];
-  const storedModel = settings !== undefined && settings.provider !== '' && settings.model !== ''
-    ? { provider: settings.provider, model: settings.model }
-    : null;
+  /* The selection in force. There is no "follow the default" row any more: the
+     plugin's own default is a concrete model, so the menu always marks exactly
+     one model as current and the trigger always names it. */
   const used = effectiveSelection(catalog.value, settings);
   const currentName = used === null ? t('model.statusEmpty') : modelName(catalog.value, used);
-  const defaultName = catalog.value?.default === undefined
-    ? '—'
-    : modelName(catalog.value, catalog.value.default);
   const showSearch = groups.reduce((total, group) => total + group.models.length, 0) > 8;
 
   return ReactRuntime.createElement(Picker, {
-    label: storedModel === null ? t('model.default', { name: defaultName }) : currentName,
+    label: currentName,
     ariaLabel: t('model.aria', { name: currentName }),
     menuAriaLabel: t('model.listAria'),
     searchPlaceholder: showSearch ? t('model.search') : undefined,
     disabled: groups.length === 0 || settings === undefined,
     onSelect: (key) => {
-      if (key === '') {
-        settingsStore.patch({ provider: '', model: '', reasoningEffort: '' });
-        return;
-      }
       const separator = key.indexOf('\u0000');
+      if (separator < 0) return;
       settingsStore.patch({
         provider: key.slice(0, separator),
         model: key.slice(separator + 1),
@@ -914,24 +911,13 @@ function ModelPicker(props) {
       }))
       .filter((entry) => entry.models.length > 0);
     return [
-      ReactRuntime.createElement(MenuGroup, { key: 'default-group', label: t('model.followingGroup') }, [
-        ReactRuntime.createElement('div', { key: 'rows', className: 'PF-menuRow' }, [
-          ReactRuntime.createElement(PickerOption, {
-            key: 'default',
-            optionKey: '',
-            selected: storedModel === null,
-            name: t('model.default', { name: defaultName }),
-            onSelect: () => choose(''),
-          }),
-        ]),
-      ]),
       ...visibleGroups.map(({ group, models }) => ReactRuntime.createElement(MenuGroup, {
         key: group.id,
         label: group.name ?? group.id,
       }, ReactRuntime.createElement('div', { className: 'PF-menuRow' }, models.map((model) => ReactRuntime.createElement(PickerOption, {
         key: `${group.id}\u0000${model.id}`,
         optionKey: `${group.id}\u0000${model.id}`,
-        selected: storedModel !== null && storedModel.provider === group.id && storedModel.model === model.id,
+        selected: used !== null && used.provider === group.id && used.model === model.id,
         name: model.name ?? model.id,
         hint: model.description,
         onSelect: () => choose(`${group.id}\u0000${model.id}`),
