@@ -65,6 +65,6 @@ $env:DSH_INSTALL_DIR = 'D:/Apps/DeepSeek Harness'
 npm run test:dsh
 ```
 
-探针通过已安装的 Electron 以 Node 模式读取 ASAR，只检查包、构建文件及接口标记，不启动 DSH 服务、不调用模型。它是结构变化的早期提示，不能验证参数类型、服务行为或模型响应；包被拆分或文件移动也会触发失败，需要结合上游代码判断。它依赖本机安装，因此不放进跨平台 CI。
+部分客户端模块已编译进 `dsh-web-frontend` 的构建产物而不再单独发行（例如 `dsh-client-ui-primitives`），因此探针对这类契约改为扫描构建产物核对模块注册 id。探针通过已安装的 Electron 以 Node 模式读取 ASAR，只检查包、构建文件及接口标记，不启动 DSH 服务、不调用模型。它是结构变化的早期提示，不能验证参数类型、服务行为或模型响应；包被拆分或文件移动也会触发失败，需要结合上游代码判断。它依赖本机安装，因此不放进跨平台 CI。
 
 GitHub Actions 在 Windows 和 Ubuntu、Node.js 24 上执行 `npm test`。真实模型和桌面联调不属于此 CI。
