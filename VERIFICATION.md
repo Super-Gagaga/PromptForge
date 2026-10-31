@@ -27,7 +27,9 @@
 
 `git diff --check` 通过。图片感知链路尚未在真实 DSH 浏览器中用实际附件复核；下文的真实验证记录属于此前构建，不能作为本轮改动的验证依据。
 
-## 上游复查：DSH 0.2.1-rc.3（2026-10-25）
+## 上游复查：DSH 0.2.1-rc.3 → rc.5
+
+### rc.3（2026-10-25）
 
 安装在 2026-10-23 的 DSH `0.2.1-rc.3` 上复查，结论是**插件本体无需改动**，只修正了仓库自带的 DSH 探针。
 
@@ -36,6 +38,14 @@
 - 真实调用（`127.0.0.1:9795`）：文件类草稿返回 5 条经校验的 `@路径`，状态 `complete`；附带一张 1×1 PNG 的草稿返回 200、无图片警告（模型接受图片），耗时 6.9 秒。
 - 发现的唯一结构变化：`@deepseek-ai/dsh-client-ui-primitives` 不再作为独立包发行，改由 `dsh-web-frontend` 的构建产物以同一模块 id 注册。插件的 `require` 仍能解析，因此无需改代码；`tools/check-dsh.mjs` 原先按包目录检查，会误报失败，已改为扫描前端构建产物核对模块注册 id。
 - 其余契约逐字未变：`FILE_REFERENCE_PROMPT`、`formatFileMention`、`SKILL_GESTURE`、`TEXT_REF_RE`、`admitPromptContent`、`inputModalities`、`conversation.input.right`、`settings.section`。
+
+### rc.5（2026-10-31）
+
+安装在 2026-10-29 的 DSH `0.2.1-rc.5` 上复查，结论仍是**插件无需改动**。
+
+- `npm test` 通过：单元 48 项、自检 96 项、覆盖率门槛、4 张配图与文档链接检查；覆盖率 `99.17 / 84.08 / 95.37`。
+- `npm run test:dsh` 11 项全部 PASS（DSH 包版本均为 `0.2.1-rc.5`），探针覆盖的契约未发生位移。
+- 真实调用（`127.0.0.1:1861`）：文件类草稿返回 5 条 `@路径`；技能类草稿返回 `/great-resume`、`/make-resume`；带 1×1 PNG 的草稿返回 200、无图片警告，并命中 `image-to-code`、`impeccable` 两个技能。三者状态均为 `complete`。
 
 ## 真实 DSH 验证
 
